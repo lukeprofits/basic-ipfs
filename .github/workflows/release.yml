@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so `git log` resolves the tagged commit's date.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Set SOURCE_DATE_EPOCH from tag commit
+        # Reproducible builds: lock archive/file mtimes to the tagged commit.
+        # `head_commit.timestamp` is ISO-8601 — setuptools needs Unix epoch.
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/basic-ipfs
+    permissions:
+      id-token: write  # OIDC for trusted publishing — no API token in repo secrets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        # Trusted publisher must be configured at:
+        # https://pypi.org/manage/project/basic-ipfs/settings/publishing/
+        # GitHub: lukeprofits/basic_ipfs   Workflow: release.yml   Environment: pypi

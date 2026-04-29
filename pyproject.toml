@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "basic-ipfs"
+version = "0.2.1"
+description = "Stupid-simple IPFS for Python. Auto-manages a real Kubo node."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Luke Profits" }]
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.28",
+    "platformdirs>=3.0",
+]
+keywords = ["ipfs", "kubo", "decentralized", "storage", "p2p"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: Internet",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "build>=1.0",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "types-requests",
+]
+
+[project.scripts]
+basic-ipfs = "basic_ipfs.cli:main"
+
+[project.urls]
+Source = "https://github.com/lukeprofits/basic_ipfs"
+Changelog = "https://github.com/lukeprofits/basic_ipfs/blob/main/CHANGELOG.md"
+Issues = "https://github.com/lukeprofits/basic_ipfs/issues"
+
+[tool.setuptools.packages.find]
+include = ["basic_ipfs*"]
+
+# py.typed marker ships in the wheel so type checkers see precise types.
+# Kubo binary is NOT shipped in the wheel — it auto-downloads on first use.
+# Keeps the wheel tiny and platform-agnostic (py3-none-any).
+[tool.setuptools.package-data]
+basic_ipfs = ["py.typed"]
+
+[tool.setuptools.exclude-package-data]
+basic_ipfs = ["bin/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:requests",
+]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["basic_ipfs"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["platformdirs.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S"]
+# E501: long-line; project favours readable error strings.
+# S101: assert is fine in tests.
+# S603/S607: subprocess args are static lists; never shell=True.
+ignore = ["E501", "S101", "S603", "S607"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S"]
+# basic_ipfs/__init__.py uses `from __future__ import annotations` and then
+# `del Any, Iterable, Union` to keep the public namespace clean — annotations
+# are lazy (PEP 563) so the deletion is safe, but ruff's F821 cannot tell.
+# S110 = best-effort cleanup with bare except-pass; intentional.
+"basic_ipfs/__init__.py" = ["F821", "S110"]

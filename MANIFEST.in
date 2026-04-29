@@ -1,0 +1,9 @@
+include CHANGELOG.md
+include SECURITY.md
+include CONTRIBUTING.md
+
+# Defensive — should never happen, but make absolutely sure the auto-downloaded
+# Kubo binary doesn't get pulled into a sdist if a developer has run tests.
+prune basic_ipfs/bin
+global-exclude *.pyc
+global-exclude __pycache__
