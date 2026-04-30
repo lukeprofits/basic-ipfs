@@ -315,6 +315,67 @@ def test_archive_info_accepts_well_formed_version(good, monkeypatch):
     assert ext in ("tar.gz", "zip")
 
 
+def test_find_or_install_prefers_user_install(tmp_path, monkeypatch):
+    """A binary in user_data_dir wins over a bundled one and over PATH."""
+    user = tmp_path / "user_install" / "ipfs"
+    user.parent.mkdir(parents=True)
+    user.write_text("#!/bin/sh\necho user\n")
+    user.chmod(0o755)
+
+    bundled = tmp_path / "bundled" / "ipfs"
+    bundled.parent.mkdir(parents=True)
+    bundled.write_text("#!/bin/sh\necho bundled\n")
+    bundled.chmod(0o755)
+
+    monkeypatch.setattr(basic_ipfs, "_user_binary_path", lambda: user)
+    monkeypatch.setattr(basic_ipfs, "_bundled_binary_path", lambda: bundled)
+
+    resolved = basic_ipfs._find_or_install_kubo()
+    assert resolved == user
+
+
+def test_find_or_install_falls_back_to_bundled(tmp_path, monkeypatch):
+    """When no user install exists, a pre-placed bundled binary still works
+    (PyInstaller / Briefcase / air-gapped deploys)."""
+    user = tmp_path / "user_install" / "ipfs"  # does not exist
+    bundled = tmp_path / "bundled" / "ipfs"
+    bundled.parent.mkdir(parents=True)
+    bundled.write_text("#!/bin/sh\necho bundled\n")
+    bundled.chmod(0o755)
+
+    monkeypatch.setattr(basic_ipfs, "_user_binary_path", lambda: user)
+    monkeypatch.setattr(basic_ipfs, "_bundled_binary_path", lambda: bundled)
+
+    resolved = basic_ipfs._find_or_install_kubo()
+    assert resolved == bundled
+
+
+def test_find_or_install_downloads_into_user_dir(tmp_path, monkeypatch):
+    """When nothing pre-existing is available, the auto-downloader writes to
+    the per-user path — never into the bundled (site-packages) location."""
+    user = tmp_path / "user_install" / "ipfs"
+    bundled = tmp_path / "bundled" / "ipfs"  # does not exist
+
+    monkeypatch.setattr(basic_ipfs, "_user_binary_path", lambda: user)
+    monkeypatch.setattr(basic_ipfs, "_bundled_binary_path", lambda: bundled)
+    monkeypatch.setattr(basic_ipfs.shutil, "which", lambda _: None)
+
+    captured: dict = {}
+
+    def fake_download(dest):
+        captured["dest"] = dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("ok")
+        dest.chmod(0o755)
+
+    monkeypatch.setattr(basic_ipfs, "_auto_download_kubo", fake_download)
+
+    resolved = basic_ipfs._find_or_install_kubo()
+    assert resolved == user
+    assert captured["dest"] == user
+    assert not bundled.exists()
+
+
 def test_download_rejects_offsite_redirect(temp_install, monkeypatch):
     """Even with TLS valid, a 30x to a non-pinned host must fail."""
     archive = _make_tarball()

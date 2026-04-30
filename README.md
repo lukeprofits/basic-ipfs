@@ -24,7 +24,7 @@ If it does exactly what you need → great, use it. If it doesn't → don't use 
 pip install basic-ipfs
 ```
 
-First call downloads the Kubo binary (~115 MB, SHA-512 verified) into the package directory and starts it as a background subprocess. The daemon stops automatically when your program exits.
+First call downloads the Kubo binary (~115 MB, SHA-512 verified) into your per-user data directory (`~/.local/share/basic_ipfs/bin/<platform>/ipfs` on Linux; `platformdirs` picks the right path per OS) and starts it as a background subprocess. The daemon stops automatically when your program exits.
 
 ### Usage
 
@@ -185,9 +185,11 @@ python your_script.py
 ```
 
 If outbound access to `dist.ipfs.tech` is blocked, pre-place the binary at
-`<site-packages>/basic_ipfs/bin/<platform>/ipfs` (or `ipfs.exe` on Windows)
-and `basic-ipfs` will skip the download entirely. Supported platform
-strings: `linux-amd64`, `linux-arm64`, `linux-riscv64`, `darwin-amd64`,
+`<user_data_dir>/basic_ipfs/bin/<platform>/ipfs` (or `ipfs.exe` on Windows)
+and `basic-ipfs` will skip the download entirely. The bundled
+`<site-packages>/basic_ipfs/bin/<platform>/ipfs` path is also honoured
+for PyInstaller / Briefcase deploys. Supported platform strings:
+`linux-amd64`, `linux-arm64`, `linux-riscv64`, `darwin-amd64`,
 `darwin-arm64`, `windows-amd64`.
 
 **Alpine / musl Linux.** Kubo upstream ships glibc binaries only.
@@ -198,8 +200,8 @@ strings: `linux-amd64`, `linux-arm64`, `linux-riscv64`, `darwin-amd64`,
 ARM builds. Run a 64-bit OS (e.g. Raspberry Pi OS 64-bit) on Pi 4/5.
 
 **Slow first run.** Auto-download is ~115 MB. Subsequent starts are fast
-(daemon comes up in ~1–3 s). The binary lives inside the package directory
-so a `pip uninstall` cleans it up.
+(daemon comes up in ~1–3 s). The binary lives in `platformdirs.user_data_dir("basic_ipfs")`
+so it survives reinstalls. To wipe it, delete that directory.
 
 **Want to inspect the daemon log.** It's at
 `<repo>/basic_ipfs_daemon.log` (rotated at 5 MB, one `.old` kept).

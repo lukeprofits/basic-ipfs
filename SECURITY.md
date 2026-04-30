@@ -11,17 +11,28 @@ Only the latest released `0.2.x` gets fixes. Upgrade if you're on `0.1.x`.
 
 When `basic-ipfs` auto-downloads a Kubo binary on first use, it:
 
-1. Computes the SHA-512 of the downloaded archive.
-2. Compares it (constant-time, `hmac.compare_digest`) against the hash
-   baked into the wheel at `basic_ipfs/kubo_checksums.py`. The hash was
-   committed and reviewed when the version was added to the table; it
-   ships inside the wheel under PyPI's release infrastructure.
+1. Streams the archive into a `.archive.partial` file inside
+   `platformdirs.user_data_dir("basic_ipfs")/bin/<platform>/`,
+   incrementally computing the SHA-512 and refusing any response that
+   exceeds an internal byte cap.
+2. Compares the digest (constant-time, `hmac.compare_digest`) against the
+   hash baked into the wheel at `basic_ipfs/kubo_checksums.py`. The hash
+   was committed and reviewed when the version was added to the table;
+   it ships inside the wheel under PyPI's release infrastructure.
 3. Refuses to install if the version is not in the table. A previous
    release would have fallen back to fetching `dist.ipfs.tech/.../.sha512`
    over TLS, but that adds no security against an origin compromise — an
    attacker controlling `dist.ipfs.tech` swaps both files together. New
    Kubo versions must have their hash committed before they can be
    installed.
+
+The binary is written to a per-user directory rather than into the
+installed wheel: site-packages is a trust boundary owned by the package
+manager, and on a multi-user host any user with write access there could
+otherwise swap the binary post-install. A pre-placed binary at
+`<site-packages>/basic_ipfs/bin/<platform>/ipfs` is still honoured (for
+PyInstaller / Briefcase / air-gapped deploys), but the auto-downloader
+never writes there.
 
 The verification is **fail-closed** in both directions: a mismatch refuses
 to install, and a missing baked hash refuses to install.
@@ -105,10 +116,10 @@ What `basic-ipfs` does **not** provide:
 
 ```bash
 # Inspect the binary's provenance:
-cat <site-packages>/basic_ipfs/bin/<platform>/.provenance.json
+cat <user_data_dir>/basic_ipfs/bin/<platform>/.provenance.json
 
 # Re-verify against the dist channel:
-cd <site-packages>/basic_ipfs/bin/<platform>
+cd <user_data_dir>/basic_ipfs/bin/<platform>
 sha512sum ipfs   # or shasum -a 512 ipfs on macOS
 curl -sf https://dist.ipfs.tech/kubo/<version>/kubo_<version>_<platform>.tar.gz.sha512
 ```
@@ -124,5 +135,7 @@ re-verify you must re-download the archive.
   channel you trust (signed messaging, in-person, etc.). It's a 256-bit
   symmetric secret that controls network membership.
 - For air-gapped environments, pre-place the verified Kubo binary at
-  `<site-packages>/basic_ipfs/bin/<platform>/ipfs` before the first call.
-  `basic-ipfs` will use it without contacting the network.
+  `<user_data_dir>/basic_ipfs/bin/<platform>/ipfs` before the first call.
+  `basic-ipfs` will use it without contacting the network. The bundled
+  `<site-packages>/basic_ipfs/bin/<platform>/ipfs` path is also accepted
+  for PyInstaller / Briefcase deploys.

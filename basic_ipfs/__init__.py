@@ -231,11 +231,12 @@ def _platform_key() -> str:
 
     if system == "linux":
         if _is_musl():
+            manual = Path(user_data_dir(APP_NAME)) / "bin" / f"linux-{machine}" / "ipfs"
             raise IPFSBinaryNotFound(
                 "Detected Alpine/musl Linux. Kubo publishes glibc binaries only.\n"
                 "  - With `apk add gcompat` the glibc build *may* run, but it isn't officially supported.\n"
                 "  - Otherwise, place a musl-compatible `ipfs` binary at:\n"
-                f"      {_base_dir() / 'bin' / f'linux-{machine}' / 'ipfs'}"
+                f"      {manual}"
             )
         if machine in ("x86_64", "amd64"):
             return "linux-amd64"
@@ -257,11 +258,12 @@ def _platform_key() -> str:
         if machine in ("amd64", "x86_64"):
             return "windows-amd64"
 
+    manual = Path(user_data_dir(APP_NAME)) / "bin" / f"{system}-{machine}" / "ipfs"
     raise IPFSBinaryNotFound(
         f"Unsupported platform: {system}/{machine}.\n"
         f"  Supported: {', '.join(_SUPPORTED_TRIPLES)}.\n"
         f"  To use an unsupported platform, place an ipfs binary manually at:\n"
-        f"    {_base_dir() / 'bin' / f'{system}-{machine}' / 'ipfs'}"
+        f"    {manual}"
     )
 
 
@@ -269,8 +271,24 @@ def _binary_name() -> str:
     return "ipfs.exe" if sys.platform == "win32" else "ipfs"
 
 
-def _binary_path() -> Path:
+def _bundled_binary_path() -> Path:
+    """Path inside the installed wheel — used for pre-placed binaries
+    (PyInstaller / Briefcase / air-gapped deploys)."""
     return _base_dir() / "bin" / _platform_key() / _binary_name()
+
+
+def _user_binary_path() -> Path:
+    """Per-user install path. The auto-downloader writes here so we never
+    mutate site-packages — site-packages is a trust boundary owned by the
+    package manager, not by runtime code, and on a multi-user host any
+    other user with write access there could swap the binary."""
+    return Path(user_data_dir(APP_NAME)) / "bin" / _platform_key() / _binary_name()
+
+
+def _binary_path() -> Path:
+    """Back-compat alias. Returns the user-install path that the downloader
+    writes to. Lookup order is implemented in _find_or_install_kubo()."""
+    return _user_binary_path()
 
 
 # ---------------------------------------------------------------------------
@@ -542,8 +560,24 @@ def _auto_download_kubo(dest: Path) -> None:
 
 
 def _find_or_install_kubo() -> Path:
-    """bin/<platform>/ipfs → system PATH → auto-download."""
-    bundled = _binary_path()
+    """user_data_dir bin → bundled bin (PyInstaller / pre-placed) → system PATH → auto-download.
+
+    Resolution order matters: a binary the user explicitly dropped into
+    user_data_dir wins so air-gapped or pre-vetted installs are honoured;
+    a binary inside the wheel wins next so PyInstaller / Briefcase
+    bundles still work; only then do we fall back to whatever ``ipfs``
+    is on PATH or download a fresh copy. The downloader always writes
+    to the user_data_dir path — never into site-packages.
+    """
+    user = _user_binary_path()
+    if user.exists():
+        try:
+            user.chmod(user.stat().st_mode | stat.S_IEXEC)
+        except OSError as exc:
+            logger.warning("could not chmod %s: %s", user, exc)
+        return user
+
+    bundled = _bundled_binary_path()
     if bundled.exists():
         try:
             bundled.chmod(bundled.stat().st_mode | stat.S_IEXEC)
@@ -558,16 +592,16 @@ def _find_or_install_kubo() -> Path:
 
     logger.info("Kubo binary not found locally — downloading %s…", KUBO_VERSION)
     try:
-        _auto_download_kubo(bundled)
+        _auto_download_kubo(user)
     except IPFSBinaryNotFound:
         raise
     except (requests.RequestException, OSError) as exc:
         raise IPFSBinaryNotFound(
             f"Failed to auto-download Kubo {KUBO_VERSION} for {_platform_key()}: {exc}\n"
             f"  Check your internet connection (or HTTPS_PROXY / REQUESTS_CA_BUNDLE), "
-            f"  or place the binary manually at:\n    {bundled}"
+            f"  or place the binary manually at:\n    {user}"
         ) from exc
-    return bundled
+    return user
 
 
 # ---------------------------------------------------------------------------
