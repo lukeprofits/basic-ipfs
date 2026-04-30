@@ -675,6 +675,61 @@ def _is_port_in_use(host: str, port: int) -> bool:
         return False
 
 
+def _secure_open(path: Path, mode: int = 0o600) -> int:
+    """Open ``path`` for writing with restrictive perms applied atomically.
+
+    Closes the TOCTOU window between ``write_text`` and ``chmod`` — without
+    this, the file briefly exists with the process umask before its mode is
+    tightened, so a co-tenant can race in and read a credential. Returns an
+    OS-level file descriptor; caller is responsible for closing it.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW  # refuse to write through a symlink swap
+    return os.open(str(path), flags, mode)
+
+
+def _secure_write_text(path: Path, text: str, mode: int = 0o600) -> None:
+    """Write ``text`` to ``path`` with ``mode`` applied at create time."""
+    fd = _secure_open(path, mode=mode)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+    except BaseException:
+        # Clean up a half-written file on any failure (KeyboardInterrupt
+        # included) so the next run starts from a known-empty state.
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _secure_mkdir(path: Path, mode: int = 0o700) -> None:
+    """Create directories up to ``path`` with restrictive ``mode``.
+
+    Each newly-created leaf is mkdir'd with the requested mode so an
+    attacker can't snapshot the directory's contents during the umask
+    window between ``mkdir`` and ``chmod``. Existing directories are left
+    alone — the operator may have intentionally widened them.
+    """
+    path = Path(path)
+    if path.exists():
+        return
+    parent = path.parent
+    if parent != path and not parent.exists():
+        _secure_mkdir(parent, mode=mode)
+    try:
+        os.mkdir(str(path), mode)
+    except FileExistsError:
+        return
+    # umask can still mask bits off; force them on for the leaf.
+    try:
+        os.chmod(str(path), mode)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # IPFSManager — process-singleton daemon lifecycle (managed via module locks)
 # ---------------------------------------------------------------------------
@@ -758,12 +813,17 @@ class IPFSManager:
 
     def _ensure_repo(self) -> None:
         assert self._repo is not None
-        self._repo.mkdir(parents=True, exist_ok=True)
+        # Create with restrictive mode atomically so a multi-user host can't
+        # peek into a freshly-created repo before chmod runs. mkdir() applies
+        # the mode under the process umask; on POSIX we re-apply afterwards
+        # to defeat a 0o077 umask, but the directory was never world-traversable
+        # because mkdir(mode=0o700) clamps via the umask only for *additional*
+        # bits — owner bits stay set. Existing dirs are left as-is (operator
+        # may have widened them deliberately).
         if os.name == "posix":
-            try:
-                self._repo.chmod(0o700)
-            except OSError as exc:
-                logger.warning("could not restrict repo perms at %s: %s", self._repo, exc)
+            _secure_mkdir(self._repo, mode=0o700)
+        else:
+            self._repo.mkdir(parents=True, exist_ok=True)
         config_path = self._repo / "config"
 
         if not config_path.exists():
@@ -840,13 +900,20 @@ class IPFSManager:
         except OSError:
             pass  # rotation is best-effort
         # Buffered: stderr write rates from Kubo are low, no need for unbuffered.
-        self._log_file = open(self._log_path, "ab")
-        # Daemon stderr contains CIDs, peer IDs, multiaddrs — restrict to owner.
+        # Open via os.open with mode 0o600 on POSIX so the file is never
+        # world-readable, even briefly. The daemon log captures CIDs, peer
+        # IDs, multiaddrs — fingerprintable activity.
         if os.name == "posix":
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            fd = os.open(str(self._log_path), flags, 0o600)
+            self._log_file = os.fdopen(fd, "ab")
+            # If the file pre-existed with a wider mode, narrow it.
             try:
                 os.chmod(self._log_path, 0o600)
             except OSError as exc:
                 logger.warning("could not restrict log perms at %s: %s", self._log_path, exc)
+        else:
+            self._log_file = open(self._log_path, "ab")
 
     def _start_daemon(self) -> None:
         if self._is_api_up():
@@ -1543,15 +1610,19 @@ def _write_swarm_key(key_hex: str) -> None:
     # Kubo reads this at startup and refuses connections from any peer whose
     # swarm.key does not contain the same 64 hex chars.
     path = _swarm_key_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"/key/swarm/psk/1.0.0/\n/base16/\n{key_hex}\n")
-    # Restrict permissions: this is a credential. World/group-readable would
-    # let any local user join the private network.
     if os.name == "posix":
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
+        _secure_mkdir(path.parent, mode=0o700)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    body = f"/key/swarm/psk/1.0.0/\n/base16/\n{key_hex}\n"
+    if os.name == "posix":
+        # Atomic create with mode 0o600 — closes the TOCTOU window between
+        # write_text() and chmod() that would otherwise leak this credential
+        # to any local user during the umask gap. swarm.key is a 256-bit
+        # symmetric secret; a single read leaks permanent network access.
+        _secure_write_text(path, body, mode=0o600)
+    else:
+        path.write_text(body)
 
 
 def _swarm_key_warn_if_world_readable() -> None:

@@ -283,6 +283,42 @@ def test_swarm_key_chmod_0600_on_posix(tmp_path, monkeypatch):
     assert mode == 0o600, f"swarm.key mode should be 0o600, got 0o{mode:o}"
 
 
+def test_swarm_key_no_world_readable_under_open_umask(tmp_path, monkeypatch):
+    """Even with a permissive umask, swarm.key must never exist with broader
+    perms than 0o600 — closes a TOCTOU where another local user could read
+    the credential between write() and chmod()."""
+    if os.name != "posix":
+        pytest.skip("POSIX-only")
+    monkeypatch.setattr(basic_ipfs, "REPO_PATH", tmp_path / "repo")
+    monkeypatch.setattr(basic_ipfs, "_manager", None)
+    old_umask = os.umask(0o000)  # most permissive — would create 0o666 files
+    try:
+        basic_ipfs.create_private_network()
+    finally:
+        os.umask(old_umask)
+    path = basic_ipfs._swarm_key_path()
+    mode = path.stat().st_mode & 0o777
+    assert mode == 0o600, f"swarm.key under open umask must be 0o600, got 0o{mode:o}"
+    # Repo dir created during the swarm-key write must also be tight.
+    repo_mode = path.parent.stat().st_mode & 0o777
+    assert repo_mode == 0o700, f"repo dir must be 0o700, got 0o{repo_mode:o}"
+
+
+def test_secure_open_refuses_symlink(tmp_path, monkeypatch):
+    """_secure_open must not follow a symlink — defends against a co-tenant
+    who pre-creates a symlink at the swarm.key path pointing at their own
+    file, so writes go through to a location they can read."""
+    if os.name != "posix":
+        pytest.skip("POSIX-only")
+    target = tmp_path / "target"
+    target.write_text("placeholder")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    with pytest.raises(OSError):
+        fd = basic_ipfs._secure_open(link)
+        os.close(fd)  # only reached if O_NOFOLLOW didn't fire (will fail test)
+
+
 def test_get_private_network_key_returns_none_if_absent(tmp_path, monkeypatch):
     monkeypatch.setattr(basic_ipfs, "REPO_PATH", tmp_path / "no_repo")
     assert basic_ipfs.get_private_network_key() is None
