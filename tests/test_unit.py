@@ -297,6 +297,44 @@ def test_is_private_network(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# IPFSOperationError structured fields
+# ---------------------------------------------------------------------------
+
+
+def test_is_not_pinned_true_for_kubo_error():
+    exc = basic_ipfs.IPFSOperationError(
+        "IPFS API error [500] pin/rm: bafy... is not pinned",
+        status_code=500,
+        kubo_code=0,
+        kubo_type="error",
+        kubo_message="bafy... is not pinned",
+    )
+    assert exc.is_not_pinned() is True
+
+
+def test_is_not_pinned_false_when_message_unrelated():
+    exc = basic_ipfs.IPFSOperationError(
+        "x",
+        status_code=500,
+        kubo_type="error",
+        kubo_message="invalid CID",
+    )
+    assert exc.is_not_pinned() is False
+
+
+def test_is_not_pinned_false_without_error_envelope():
+    """An unstructured 502 (e.g. an HTML reverse-proxy page that happens to
+    contain the words 'not pinned') must not be treated as a successful no-op."""
+    exc = basic_ipfs.IPFSOperationError(
+        "<html>not pinned</html>",
+        status_code=502,
+        kubo_type=None,
+        kubo_message=None,
+    )
+    assert exc.is_not_pinned() is False
+
+
+# ---------------------------------------------------------------------------
 # Exception hierarchy
 # ---------------------------------------------------------------------------
 

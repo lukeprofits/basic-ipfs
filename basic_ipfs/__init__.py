@@ -136,7 +136,41 @@ class IPFSDaemonTimeout(IPFSError):
 
 
 class IPFSOperationError(IPFSError):
-    """An IPFS API call returned an error."""
+    """An IPFS API call returned an error.
+
+    Attributes mirror Kubo's JSON error envelope so callers can branch on
+    the structured fields instead of pattern-matching the message string.
+    Any of them may be ``None`` if the response was not a well-formed Kubo
+    error body (e.g. an HTML 502 from a reverse proxy).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        kubo_code: int | None = None,
+        kubo_type: str | None = None,
+        kubo_message: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.kubo_code = kubo_code
+        self.kubo_type = kubo_type
+        self.kubo_message = kubo_message
+
+    def is_not_pinned(self) -> bool:
+        """True iff this error is Kubo's ``<cid> is not pinned`` response.
+
+        Used to make pin-removal idempotent without swallowing real failures.
+        Requires both a Kubo-shaped error body (``Type == "error"``) and the
+        canonical ``not pinned`` substring — guards against accidentally
+        treating an unrelated 500 as a successful no-op.
+        """
+        if self.kubo_type != "error":
+            return False
+        msg = (self.kubo_message or "").lower()
+        return "not pinned" in msg
 
 
 class IPFSPortInUse(IPFSError):
@@ -895,12 +929,28 @@ class IPFSManager:
             ) from exc
 
         if not resp.ok:
+            kubo_code: int | None = None
+            kubo_type: str | None = None
+            kubo_message: str | None = None
             try:
-                detail = resp.json().get("Message", resp.text)
+                body = resp.json()
             except Exception:
-                detail = resp.text
+                body = None
+            if isinstance(body, dict):
+                kubo_message = body.get("Message")
+                raw_code = body.get("Code")
+                if isinstance(raw_code, int):
+                    kubo_code = raw_code
+                raw_type = body.get("Type")
+                if isinstance(raw_type, str):
+                    kubo_type = raw_type
+            detail = kubo_message if kubo_message is not None else resp.text
             raise IPFSOperationError(
-                f"IPFS API error [{resp.status_code}] {endpoint}: {detail}"
+                f"IPFS API error [{resp.status_code}] {endpoint}: {detail}",
+                status_code=resp.status_code,
+                kubo_code=kubo_code,
+                kubo_type=kubo_type,
+                kubo_message=kubo_message,
             )
         return resp
 
@@ -1046,7 +1096,7 @@ class IPFSManager:
                 params.append(("recursive", "true"))
                 self._post("pin/rm", params=params, timeout=60)
             except IPFSOperationError as exc:
-                if "not pinned" not in str(exc).lower():
+                if not exc.is_not_pinned():
                     raise
                 # One or more CIDs in the batch weren't pinned. Kubo aborts the
                 # whole batch in that case, so fall back to per-CID removal to
@@ -1059,7 +1109,7 @@ class IPFSManager:
                             timeout=60,
                         )
                     except IPFSOperationError as per_exc:
-                        if "not pinned" not in str(per_exc).lower():
+                        if not per_exc.is_not_pinned():
                             raise
 
     def pin_ls(self) -> list[str]:
@@ -1074,7 +1124,7 @@ class IPFSManager:
             self._post("pin/ls", params={"arg": cid, "type": "recursive"}, timeout=10)
             return True
         except IPFSOperationError as exc:
-            if "not pinned" in str(exc).lower():
+            if exc.is_not_pinned():
                 return False
             raise
 
