@@ -167,6 +167,89 @@ def test_install_atomic_no_partial_left_behind(temp_install, monkeypatch):
     with pytest.raises(OSError):
         basic_ipfs._auto_download_kubo(temp_install)
     assert not temp_install.exists()
+    # Streamed archive must be cleaned up even on extraction failure.
+    assert not (temp_install.parent / (temp_install.name + ".archive.partial")).exists()
+    assert not (temp_install.parent / (temp_install.name + ".partial")).exists()
+
+
+def test_download_aborts_when_response_exceeds_cap(tmp_path, monkeypatch):
+    """A hostile origin that streams past _MAX_DOWNLOAD_BYTES must be cut off
+    before exhausting disk."""
+    monkeypatch.setattr(basic_ipfs, "_MAX_DOWNLOAD_BYTES", 1024)
+
+    huge_chunks = [b"x" * 256 for _ in range(20)]  # 5120 bytes — well over cap
+
+    class _BigSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def get(self, url, *_a, **_kw):
+            return _BigResponse(url)
+
+        def close(self):
+            pass
+
+        def mount(self, *_a, **_kw):
+            pass
+
+    class _BigResponse:
+        def __init__(self, url):
+            self.url = url
+            self.status_code = 200
+            self.headers = {"Content-Length": "999999"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=1):
+            yield from huge_chunks
+
+    monkeypatch.setattr(basic_ipfs, "_download_session", lambda: _BigSession())
+    dest = tmp_path / "archive.bin"
+    with pytest.raises(IPFSBinaryNotFound) as excinfo:
+        basic_ipfs._download("https://dist.ipfs.tech/fake", dest)
+    assert "more than" in str(excinfo.value).lower()
+
+
+def test_download_returns_sha512_hex(tmp_path, monkeypatch):
+    payload = b"hello world"
+    monkeypatch.setattr(
+        basic_ipfs, "_download_session",
+        lambda: _patch_session_factory(payload),
+    )
+    dest = tmp_path / "out.bin"
+    digest = basic_ipfs._download("https://dist.ipfs.tech/fake", dest)
+    assert digest == hashlib.sha512(payload).hexdigest()
+    assert dest.read_bytes() == payload
+
+
+def _patch_session_factory(payload: bytes):
+    class _S:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def get(self, url, *_a, **_kw):
+            return _FakeResponse(payload, url=url)
+
+        def close(self):
+            pass
+
+        def mount(self, *_a, **_kw):
+            pass
+
+    return _S()
 
 
 

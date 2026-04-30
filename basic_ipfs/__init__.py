@@ -333,24 +333,45 @@ def _check_redirect_origin(final_url: str) -> None:
     )
 
 
-def _download(url: str, timeout: int = 600) -> bytes:
+def _download(url: str, dest: Path, timeout: int = 600) -> str:
+    """Stream ``url`` into ``dest``, returning the SHA-512 hex digest.
+
+    The whole archive used to be buffered in memory, which let a hostile
+    origin (or any 30x to a misconfigured mirror) waste up to a gigabyte
+    of RAM before the SHA mismatch ever rejected it. Stream to disk
+    instead, hash incrementally, and abort early if the byte count
+    exceeds ``_MAX_DOWNLOAD_BYTES`` — the hash check is still
+    fail-closed, this just bounds the resource cost of a bad response.
+    """
     logger.info("Downloading %s", url)
     last_pct_logged = -1
+    hasher = hashlib.sha512()
+    received = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
     with _download_session() as session, session.get(url, stream=True, timeout=timeout) as r:
         _check_redirect_origin(r.url)
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", 0))
-        chunks: list[bytes] = []
-        received = 0
-        for chunk in r.iter_content(chunk_size=1 << 16):
-            chunks.append(chunk)
-            received += len(chunk)
-            if total:
-                pct = received * 100 // total
-                if pct >= last_pct_logged + 10:
-                    logger.info("  %3d%%  (%d / %d bytes)", pct, received, total)
-                    last_pct_logged = pct
-        return b"".join(chunks)
+        with open(dest, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=1 << 16):
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > _MAX_DOWNLOAD_BYTES:
+                    raise IPFSBinaryNotFound(
+                        f"Refusing to download more than {_MAX_DOWNLOAD_BYTES} bytes "
+                        f"from {url} — got {received} bytes and counting. "
+                        f"Either the origin is misbehaving or KUBO_VERSION points at "
+                        f"something unexpected."
+                    )
+                hasher.update(chunk)
+                fh.write(chunk)
+                if total:
+                    pct = received * 100 // total
+                    if pct >= last_pct_logged + 10:
+                        logger.info("  %3d%%  (%d / %d bytes)", pct, received, total)
+                        last_pct_logged = pct
+    return hasher.hexdigest().lower()
 
 
 def _expected_sha512(archive_url: str) -> str:
@@ -381,6 +402,13 @@ def _expected_sha512(archive_url: str) -> str:
 _MAX_ARCHIVE_MEMBER_BYTES = 512 * 1024 * 1024  # 512 MB per entry
 _MAX_ARCHIVE_PATH_DEPTH = 4
 
+# Hard ceiling on the streamed download itself — independent of the per-member
+# cap above, because streaming happens before extraction. A hostile origin (or
+# a Content-Length that lies) cannot cost us more than this in disk + time.
+# Twice the per-member cap leaves comfortable headroom for archive overhead
+# while still bounding the worst case.
+_MAX_DOWNLOAD_BYTES = 2 * _MAX_ARCHIVE_MEMBER_BYTES
+
 
 def _safe_member_name(name: str) -> bool:
     # Defence in depth: extraction never honours the member's path (we always
@@ -398,10 +426,10 @@ def _safe_member_name(name: str) -> bool:
     return all(part not in ("..",) for part in parts)
 
 
-def _extract_binary(archive_data: bytes, ext: str, dest: Path) -> None:
+def _extract_binary(archive_path: Path, ext: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if ext == "tar.gz":
-        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tf:
+        with tarfile.open(str(archive_path), mode="r:gz") as tf:
             for member in tf.getmembers():
                 if not member.isfile() or Path(member.name).name != "ipfs":
                     continue
@@ -416,10 +444,11 @@ def _extract_binary(archive_data: bytes, ext: str, dest: Path) -> None:
                     )
                 src = tf.extractfile(member)
                 if src is not None:
-                    dest.write_bytes(src.read())
+                    with open(dest, "wb") as out:
+                        shutil.copyfileobj(src, out, length=1 << 16)
                 break
     else:
-        with zipfile.ZipFile(io.BytesIO(archive_data)) as zf:
+        with zipfile.ZipFile(str(archive_path)) as zf:
             for info in zf.infolist():
                 if Path(info.filename).name != "ipfs.exe":
                     continue
@@ -432,7 +461,8 @@ def _extract_binary(archive_data: bytes, ext: str, dest: Path) -> None:
                         f"Archive member {info.filename!r} is {info.file_size} bytes — "
                         f"exceeds the {_MAX_ARCHIVE_MEMBER_BYTES}-byte cap."
                     )
-                dest.write_bytes(zf.read(info.filename))
+                with zf.open(info.filename) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out, length=1 << 16)
                 break
 
     if not dest.exists():
@@ -480,23 +510,31 @@ def _write_provenance(binary_path: Path, url: str, sha512_hex: str) -> None:
 def _auto_download_kubo(dest: Path) -> None:
     archive_url, ext = _archive_info()
     _check_disk_space(dest)
-
-    archive = _download(archive_url)
-
     expected = _expected_sha512(archive_url)
-    actual = hashlib.sha512(archive).hexdigest().lower()
-    if not hmac.compare_digest(actual, expected):
-        raise IPFSBinaryNotFound(
-            f"SHA-512 mismatch for Kubo {KUBO_VERSION} ({_platform_key()}): "
-            f"expected {expected}, got {actual}. Refusing to install an unverified binary."
-        )
 
-    # Extract to a sibling .partial path, then atomic rename. Prevents a
-    # half-written binary on interrupted installs.
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    archive_tmp = dest.parent / (dest.name + ".archive.partial")
+    archive_tmp.unlink(missing_ok=True)
     partial = dest.parent / (dest.name + ".partial")
     partial.unlink(missing_ok=True)
-    _extract_binary(archive, ext, partial)
-    os.replace(partial, dest)
+
+    try:
+        actual = _download(archive_url, archive_tmp)
+        if not hmac.compare_digest(actual, expected):
+            raise IPFSBinaryNotFound(
+                f"SHA-512 mismatch for Kubo {KUBO_VERSION} ({_platform_key()}): "
+                f"expected {expected}, got {actual}. Refusing to install an unverified binary."
+            )
+        # Extract to a sibling .partial path, then atomic rename. Prevents a
+        # half-written binary on interrupted installs.
+        _extract_binary(archive_tmp, ext, partial)
+        os.replace(partial, dest)
+    finally:
+        # Always clean up the streamed archive; never leave a half-written
+        # .partial executable around on a verification or extraction failure.
+        archive_tmp.unlink(missing_ok=True)
+        if partial.exists() and not dest.exists():
+            partial.unlink(missing_ok=True)
 
     _write_provenance(dest, archive_url, expected)
     logger.info("Kubo %s installed at %s (verified via baked-in SHA-512)",
