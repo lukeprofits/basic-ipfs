@@ -337,8 +337,19 @@ _MAX_ARCHIVE_PATH_DEPTH = 4
 
 
 def _safe_member_name(name: str) -> bool:
-    parts = Path(name).parts
-    return 0 < len(parts) <= _MAX_ARCHIVE_PATH_DEPTH
+    # Defence in depth: extraction never honours the member's path (we always
+    # write to a fixed `dest`), but reject obviously-hostile names anyway so
+    # the helper matches its name and a future refactor that does honour the
+    # path stays safe.
+    if not name or name.startswith(("/", "\\")):
+        return False
+    p = Path(name)
+    if p.is_absolute():
+        return False
+    parts = p.parts
+    if not 0 < len(parts) <= _MAX_ARCHIVE_PATH_DEPTH:
+        return False
+    return all(part not in ("..",) for part in parts)
 
 
 def _extract_binary(archive_data: bytes, ext: str, dest: Path) -> None:

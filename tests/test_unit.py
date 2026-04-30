@@ -21,6 +21,7 @@ from basic_ipfs import (
     _as_str_list,
     _chunked,
     _is_port_in_use,
+    _safe_member_name,
     kubo_checksums,
 )
 
@@ -125,6 +126,32 @@ def test_port_in_use_detects_bound_socket():
 def test_port_in_use_false_for_unbound():
     # 1 is reserved and almost never has a listener.
     assert _is_port_in_use("127.0.0.1", 1) is False
+
+
+# ---------------------------------------------------------------------------
+# _safe_member_name
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", [
+    "kubo/ipfs",
+    "kubo/bin/ipfs",
+    "ipfs.exe",
+])
+def test_safe_member_name_accepts_normal(name):
+    assert _safe_member_name(name) is True
+
+
+@pytest.mark.parametrize("name", [
+    "",
+    "/etc/passwd",
+    "\\Windows\\System32\\evil.exe",
+    "../../../etc/passwd",
+    "kubo/../../etc/passwd",
+    "a/b/c/d/e/f",  # exceeds depth cap
+])
+def test_safe_member_name_rejects_hostile(name):
+    assert _safe_member_name(name) is False
 
 
 # ---------------------------------------------------------------------------
