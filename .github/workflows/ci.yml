@@ -99,6 +99,27 @@ jobs:
         run: |
           ls dist/
           test -f dist/*-py3-none-any.whl
+      - name: Confirm wheel and sdist contain no Kubo binary
+        # The wheel must stay tiny (~28 KB, py3-none-any). MANIFEST.in's
+        # `prune basic_ipfs/bin` and pyproject's exclude-package-data both
+        # mean to keep the auto-downloaded Kubo binary out of distributions
+        # — fail the build loudly if either ever leaks one in.
+        run: |
+          set -euo pipefail
+          for whl in dist/*.whl; do
+            echo "Inspecting $whl"
+            if python -m zipfile -l "$whl" | grep -E '/bin(/|$)'; then
+              echo "ERROR: wheel $whl contains a bin/ entry"
+              exit 1
+            fi
+          done
+          for sdist in dist/*.tar.gz; do
+            echo "Inspecting $sdist"
+            if tar -tzf "$sdist" | grep -E '/basic_ipfs/bin(/|$)'; then
+              echo "ERROR: sdist $sdist contains basic_ipfs/bin"
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: dist
