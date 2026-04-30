@@ -22,6 +22,7 @@ from pathlib import Path
 import requests
 
 DIST = "https://dist.ipfs.tech/kubo"
+GITHUB = "https://github.com/ipfs/kubo/releases/download"
 PLATFORMS = [
     ("linux-amd64",   "tar.gz"),
     ("linux-arm64",   "tar.gz"),
@@ -32,14 +33,37 @@ PLATFORMS = [
 ]
 
 
-def fetch_sha(version: str, platform: str, ext: str) -> str:
-    url = f"{DIST}/{version}/kubo_{version}_{platform}.{ext}.sha512"
-    r = requests.get(url, timeout=30)
+def _fetch_sha(url: str) -> str:
+    r = requests.get(url, timeout=30, allow_redirects=True)
     r.raise_for_status()
     sha = r.text.strip().split()[0].lower()
     if len(sha) != 128 or not all(c in "0123456789abcdef" for c in sha):
         raise SystemExit(f"unexpected SHA-512 from {url}: {r.text!r}")
     return sha
+
+
+def fetch_sha(version: str, platform: str, ext: str) -> str:
+    """Fetch the SHA-512 from both dist.ipfs.tech and github.com release
+    assets, refusing to record it unless both sources agree.
+
+    Two independent origins (Cloudflare-fronted dist + GitHub release CDN)
+    means an attacker has to compromise both to get a malicious hash baked
+    into the wheel. That's the trust gate this script controls — once a
+    hash lands in kubo_checksums.py and is committed, runtime verification
+    in basic_ipfs/__init__.py is fail-closed against any single origin
+    being swapped.
+    """
+    archive = f"kubo_{version}_{platform}.{ext}"
+    dist_sha = _fetch_sha(f"{DIST}/{version}/{archive}.sha512")
+    gh_sha = _fetch_sha(f"{GITHUB}/{version}/{archive}.sha512")
+    if dist_sha != gh_sha:
+        raise SystemExit(
+            f"SHA-512 disagreement for {archive}:\n"
+            f"  dist.ipfs.tech: {dist_sha}\n"
+            f"  github.com:     {gh_sha}\n"
+            f"Refusing to record an ambiguous hash. Investigate before retrying."
+        )
+    return dist_sha
 
 
 def update_table(version: str, shas: dict[str, str]) -> None:
@@ -90,7 +114,7 @@ def main() -> int:
         print("ok")
 
     update_table(version, shas)
-    print(f"\nDone. Review the diff, then bump KUBO_VERSION in basic_ipfs/__init__.py and commit.")
+    print("\nDone. Review the diff, then bump KUBO_VERSION in basic_ipfs/__init__.py and commit.")
     return 0
 
 
