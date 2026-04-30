@@ -52,7 +52,19 @@ from platformdirs import user_data_dir
 
 from . import kubo_checksums
 
-__version__ = "0.2.1"
+# Single source of truth: the version that pip resolved when installing this
+# wheel. Avoids drift between pyproject.toml and a hardcoded literal — if
+# __version__ ever lies about which fix is deployed, security advisories
+# become very hard to reason about.
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("basic-ipfs")
+except PackageNotFoundError:
+    # Running from a source checkout that was never installed (e.g. tests
+    # invoked with `pytest` against the working tree). Stay obviously fake.
+    __version__ = "0+unknown"
 
 logger = logging.getLogger(__name__)
 

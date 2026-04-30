@@ -337,6 +337,21 @@ def test_node_class_and_alias_are_same():
 
 
 # ---------------------------------------------------------------------------
+# __version__ source
+# ---------------------------------------------------------------------------
+
+
+def test_version_matches_installed_metadata():
+    """__version__ must match what pip resolved, not a hardcoded literal."""
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        installed = version("basic-ipfs")
+    except PackageNotFoundError:
+        pytest.skip("basic-ipfs not installed (source checkout)")
+    assert basic_ipfs.__version__ == installed
+
+
+# ---------------------------------------------------------------------------
 # Module-level long-name aliases
 # ---------------------------------------------------------------------------
 
