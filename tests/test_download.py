@@ -209,6 +209,29 @@ def test_download_session_has_retry_adapter():
     session.close()
 
 
+@pytest.mark.parametrize("bad", [
+    "v0.40.1/../../evil",
+    "v0.40.1\nfoo",
+    "0.40.1",       # missing leading 'v'
+    "v0.40",        # only major.minor
+    "v0.40.1 ",     # trailing whitespace
+    "",
+])
+def test_archive_info_rejects_malformed_version(bad, monkeypatch):
+    monkeypatch.setattr(basic_ipfs, "KUBO_VERSION", bad)
+    with pytest.raises(IPFSBinaryNotFound) as excinfo:
+        basic_ipfs._archive_info()
+    assert "kubo_version" in str(excinfo.value).lower()
+
+
+@pytest.mark.parametrize("good", ["v0.40.1", "v1.2.3", "v0.41.0-rc1"])
+def test_archive_info_accepts_well_formed_version(good, monkeypatch):
+    monkeypatch.setattr(basic_ipfs, "KUBO_VERSION", good)
+    url, ext = basic_ipfs._archive_info()
+    assert good in url
+    assert ext in ("tar.gz", "zip")
+
+
 def test_download_rejects_offsite_redirect(temp_install, monkeypatch):
     """Even with TLS valid, a 30x to a non-pinned host must fail."""
     archive = _make_tarball()

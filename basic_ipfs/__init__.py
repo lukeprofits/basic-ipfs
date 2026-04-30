@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -231,7 +232,21 @@ def _binary_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
+# Kubo version strings look like ``v0.40.1`` or ``v0.41.0-rc1``. We
+# interpolate KUBO_VERSION into a download URL, so anything outside this
+# shape (path traversal, query injection, accidental whitespace) is
+# rejected before it can reach _download(). Defence in depth: the redirect
+# host pin and the baked-in SHA-512 table also block the attack, but a
+# regex gate makes the failure mode obvious and local.
+_KUBO_VERSION_RE = re.compile(r"^v\d+\.\d+\.\d+(-rc\d+)?$")
+
+
 def _archive_info() -> tuple[str, str]:
+    if not _KUBO_VERSION_RE.match(KUBO_VERSION):
+        raise IPFSBinaryNotFound(
+            f"Refusing to download with malformed KUBO_VERSION {KUBO_VERSION!r}. "
+            f"Expected something like 'v0.40.1' or 'v0.41.0-rc1'."
+        )
     key = _platform_key()
     os_name, arch = key.split("-", 1)
     ext = "zip" if os_name == "windows" else "tar.gz"
