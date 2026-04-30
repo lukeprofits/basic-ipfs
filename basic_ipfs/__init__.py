@@ -428,6 +428,14 @@ _MAX_ARCHIVE_PATH_DEPTH = 4
 _MAX_DOWNLOAD_BYTES = 2 * _MAX_ARCHIVE_MEMBER_BYTES
 
 
+# Default cap when ``get(cid)`` is asked to return bytes (no output_path).
+# Without this, a 4 GB CID returned via `bytes` allocates 4 GB of process
+# RSS — fine for a CLI tool, lethal for a long-running service. Callers
+# who really want the entire payload in memory should write to disk and
+# read back, or set ``MAX_GET_BYTES`` to ``None`` to opt out.
+MAX_GET_BYTES: int | None = 256 * 1024 * 1024
+
+
 def _safe_member_name(name: str) -> bool:
     # Defence in depth: extraction never honours the member's path (we always
     # write to a fixed `dest`), but reject obviously-hostile names anyway so
@@ -1237,14 +1245,44 @@ class IPFSManager:
         cid: str = json.loads(lines[-1])["Hash"]
         return cid
 
-    def cat(self, cid: str, output_path: str | os.PathLike[str] | None = None) -> bytes | None:
-        resp = self._post("cat", params={"arg": cid}, stream=True, timeout=None)
+    def cat(
+        self,
+        cid: str,
+        output_path: str | os.PathLike[str] | None = None,
+        *,
+        timeout: float | None = None,
+        max_bytes: int | None = -1,
+    ) -> bytes | None:
+        # Streaming path: writing to disk is unbounded — the caller chose to
+        # spend disk, not RAM. The in-memory path is bounded by
+        # ``max_bytes`` (or the module-level ``MAX_GET_BYTES`` default), so a
+        # malicious / oversized CID can't OOM a long-running service.
+        resp = self._post("cat", params={"arg": cid}, stream=True, timeout=timeout)
         if output_path is not None:
             with open(os.fspath(output_path), "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=1 << 16):
                     fh.write(chunk)
             return None
-        return resp.content
+        # Sentinel ``-1`` means "use the module default"; explicit ``None``
+        # means "no cap" so callers who really want unbounded bytes can opt
+        # out without monkey-patching the module global.
+        cap = MAX_GET_BYTES if max_bytes == -1 else max_bytes
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=1 << 16):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if cap is not None and len(buf) > cap:
+                # Abort the stream rather than continue reading; close the
+                # connection so we don't keep the daemon writing.
+                resp.close()
+                raise IPFSOperationError(
+                    f"Refusing to load CID {cid} into memory: exceeds "
+                    f"{cap} bytes (already received {len(buf)}). "
+                    f"Pass an output_path to stream to disk, or set "
+                    f"basic_ipfs.MAX_GET_BYTES = None / a larger value."
+                )
+        return bytes(buf)
 
     def pin_add(self, cids: str | Iterable[str]) -> None:
         cid_list = _as_str_list(cids)
@@ -1403,13 +1441,31 @@ def get(cid: str) -> bytes: ...
 def get(cid: str, output_path: str | os.PathLike[str]) -> None: ...
 
 
-def get(cid: str, output_path: str | os.PathLike[str] | None = None) -> bytes | None:
+def get(
+    cid: str,
+    output_path: str | os.PathLike[str] | None = None,
+    *,
+    timeout: float | None = None,
+    max_bytes: int | None = -1,
+) -> bytes | None:
     """Retrieve content by CID.
 
-    Returns bytes unless output_path is given (then writes to disk and
-    returns None).
+    Returns bytes unless ``output_path`` is given (then writes to disk and
+    returns ``None``).
+
+    ``timeout`` (seconds) bounds how long the daemon may spend fetching the
+    content. With ``timeout=None`` (default) the call inherits Kubo's own
+    behaviour, which is to wait indefinitely for a peer to serve the CID —
+    set a finite value if you want this call to fail fast on unreachable
+    content.
+
+    ``max_bytes`` caps the size of the in-memory return value. The default
+    sentinel ``-1`` uses ``basic_ipfs.MAX_GET_BYTES`` (256 MB out of the
+    box). Pass ``None`` to opt out of the cap entirely (e.g. a CLI tool
+    that's fine letting the OS OOM-kill it). Ignored when ``output_path``
+    is set — streaming to disk is unbounded by design.
     """
-    return _get_manager().cat(cid, output_path)
+    return _get_manager().cat(cid, output_path, timeout=timeout, max_bytes=max_bytes)
 
 
 def pin(cids: str | Iterable[str]) -> None:

@@ -537,3 +537,72 @@ def test_disk_space_check_passes_when_plenty(tmp_path, monkeypatch):
     monkeypatch.setattr(basic_ipfs.shutil, "disk_usage", lambda _p: fake_usage)
     # Should not raise.
     basic_ipfs._check_disk_space(tmp_path / "bin" / "ipfs")
+
+
+# ---------------------------------------------------------------------------
+# IPFSManager.cat — byte cap on in-memory return
+# ---------------------------------------------------------------------------
+
+
+class _StreamingResponse:
+    """A Response-like object whose iter_content yields fixed-size chunks."""
+
+    def __init__(self, total_bytes: int, chunk_size: int = 1 << 14):
+        self._remaining = total_bytes
+        self._chunk = chunk_size
+        self.closed = False
+        self.status_code = 200
+
+    def iter_content(self, chunk_size: int = 1 << 14):
+        # Honour the caller-requested chunk size; in production this matches
+        # what cat() asks for (1 << 16). The exact size isn't load-bearing.
+        del chunk_size
+        while self._remaining > 0:
+            n = min(self._chunk, self._remaining)
+            self._remaining -= n
+            yield b"\x00" * n
+
+    def close(self):
+        self.closed = True
+
+
+def _cat_manager(response):
+    m = basic_ipfs.IPFSManager()
+    m._post = lambda *a, **kw: response  # type: ignore[assignment]
+    return m
+
+
+def test_cat_in_memory_respects_byte_cap():
+    resp = _StreamingResponse(total_bytes=2 * 1024 * 1024)
+    m = _cat_manager(resp)
+    with pytest.raises(basic_ipfs.IPFSOperationError) as excinfo:
+        m.cat("bafyFake", max_bytes=512 * 1024)
+    assert "exceeds" in str(excinfo.value).lower()
+    assert resp.closed, "cat() must close the streaming response on cap breach"
+
+
+def test_cat_in_memory_under_cap_returns_full_bytes():
+    resp = _StreamingResponse(total_bytes=128 * 1024)
+    m = _cat_manager(resp)
+    out = m.cat("bafyFake", max_bytes=1 * 1024 * 1024)
+    assert isinstance(out, bytes)
+    assert len(out) == 128 * 1024
+
+
+def test_cat_in_memory_unbounded_when_max_bytes_none():
+    """Opt-out path: max_bytes=None means no cap, even if MAX_GET_BYTES is set."""
+    resp = _StreamingResponse(total_bytes=2 * 1024 * 1024)
+    m = _cat_manager(resp)
+    out = m.cat("bafyFake", max_bytes=None)
+    assert isinstance(out, bytes)
+    assert len(out) == 2 * 1024 * 1024
+
+
+def test_cat_to_disk_is_unbounded(tmp_path):
+    """Streaming to disk has no cap — caller already chose to spend disk."""
+    resp = _StreamingResponse(total_bytes=4 * 1024 * 1024)
+    m = _cat_manager(resp)
+    out_path = tmp_path / "blob"
+    result = m.cat("bafyFake", out_path, max_bytes=1)  # cap ignored
+    assert result is None
+    assert out_path.stat().st_size == 4 * 1024 * 1024
