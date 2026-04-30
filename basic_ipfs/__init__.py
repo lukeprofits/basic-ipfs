@@ -1043,6 +1043,7 @@ class IPFSManager:
         source: str | bytes | os.PathLike[str],
         pin: bool,
         provide: bool = True,
+        only_hash: bool = False,
     ) -> str:
         if isinstance(source, (bytes, bytearray, memoryview)):
             file_obj: io.IOBase = io.BytesIO(bytes(source))
@@ -1073,6 +1074,12 @@ class IPFSManager:
             # who already know the CID can fetch via bitswap, but no provider
             # record is published.
             params.append(("provide", "false"))
+        if only_hash:
+            # Compute the CID without writing a block to the repo, pinning,
+            # or announcing anything. Pin/provide flags are silently ignored
+            # by Kubo when only-hash is set; we still send the same shape so
+            # the request is uniform with the regular add path.
+            params.append(("only-hash", "true"))
         try:
             resp = self._post(
                 "add",
@@ -1101,6 +1108,15 @@ class IPFSManager:
         provide: bool = True,
     ) -> str:
         return self._add(source, pin=False, provide=provide)
+
+    def compute_cid_locally(
+        self,
+        source: str | bytes | os.PathLike[str],
+    ) -> str:
+        # only-hash=true is Kubo's "chunk and hash, do not write" mode. No
+        # block is stored in the repo, no pin is created, no provider record
+        # is announced, no peer ever learns the CID exists.
+        return self._add(source, pin=False, provide=False, only_hash=True)
 
     def add_folder(self, path: str | os.PathLike[str]) -> str:
         src = Path(os.fspath(path)).resolve()
@@ -1368,6 +1384,24 @@ def garbage_collection() -> None:
 def add_folder(path: str | os.PathLike[str]) -> str:
     """Add a directory to IPFS recursively and pin it. Returns the root CID."""
     return _get_manager().add_folder(path)
+
+
+def compute_cid_locally(
+    source: str | bytes | os.PathLike[str],
+) -> str:
+    """Return the CID a file or bytes payload *would* have, without
+    publishing anything.
+
+    Chunks and hashes the data using Kubo's ``add --only-hash`` mode:
+    no block is written to the repo, no pin is created, no provider
+    record is announced to the DHT, no peer ever learns the CID exists.
+    Useful for previewing the CID of content you have not yet decided
+    to publish.
+
+    Output matches what ``add()`` / ``announce()`` would return for the
+    same bytes (CIDv1, default chunker).
+    """
+    return _get_manager().compute_cid_locally(source)
 
 
 def peers() -> list[str]:
@@ -1749,7 +1783,7 @@ get_ipfs_status = status
 
 __all__ = [
     # short API
-    "add", "announce", "add_folder",
+    "add", "announce", "add_folder", "compute_cid_locally",
     "get", "pin", "unpin", "get_all_pins", "is_pinned",
     "exists", "garbage_collection",
     "peers", "connect_to_node", "connect_to_nodes", "my_node_multiaddress",

@@ -154,6 +154,32 @@ def test_unpin_list():
         assert cid not in pinned
 
 
+def test_compute_cid_locally_matches_add():
+    payload = b"compute-cid-locally test bytes"
+    expected = basic_ipfs.add(payload)
+    try:
+        local_cid = basic_ipfs.compute_cid_locally(payload)
+        assert local_cid == expected
+    finally:
+        basic_ipfs.unpin(expected)
+
+
+def test_compute_cid_locally_does_not_pin_or_store(tmp_path):
+    """A file the local node has never seen before should not appear in
+    the local repo or pin set after compute_cid_locally."""
+    payload = os.urandom(2048) + b"-only-hash-marker"
+    cid = basic_ipfs.compute_cid_locally(payload)
+    assert cid not in basic_ipfs.get_all_pins()
+    assert basic_ipfs.exists(cid) is False
+
+
+def test_compute_cid_locally_accepts_path(tmp_path):
+    p = tmp_path / "x.bin"
+    p.write_bytes(b"path input for only-hash")
+    cid = basic_ipfs.compute_cid_locally(str(p))
+    assert isinstance(cid, str) and len(cid) > 10
+
+
 def test_announce_bytes_roundtrip():
     payload = b"announced content - basic_ipfs test"
     cid = basic_ipfs.announce(payload)

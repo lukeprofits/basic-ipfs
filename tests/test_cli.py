@@ -34,7 +34,7 @@ def test_cli_help_lists_all_subcommands():
     out = result.stdout
     expected = [
         "status", "pins",
-        "add", "announce", "add-folder",
+        "add", "announce", "add-folder", "compute-cid",
         "get", "pin", "unpin",
         "is-pinned", "exists", "gc",
         "peers", "connect", "connect-nodes", "my-addr",
@@ -50,6 +50,7 @@ def test_cli_subcommand_help():
     subcommands = [
         ("status",), ("pins",),
         ("add", "--help"), ("announce", "--help"), ("add-folder", "--help"),
+        ("compute-cid", "--help"),
         ("get", "--help"), ("pin", "--help"), ("unpin", "--help"),
         ("is-pinned", "--help"), ("exists", "--help"), ("gc", "--help"),
         ("peers", "--help"), ("connect", "--help"), ("connect-nodes", "--help"),

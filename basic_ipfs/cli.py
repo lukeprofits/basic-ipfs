@@ -12,6 +12,7 @@ from . import (
     add,
     add_folder,
     announce,
+    compute_cid_locally,
     connect_to_node,
     connect_to_nodes,
     create_private_network,
@@ -63,6 +64,15 @@ def _cmd_announce(args: argparse.Namespace) -> int:
 
 def _cmd_add_folder(args: argparse.Namespace) -> int:
     cid = add_folder(args.path)
+    print(cid)
+    return 0
+
+
+def _cmd_compute_cid_locally(args: argparse.Namespace) -> int:
+    source: str | bytes = args.path
+    if args.path == "-":
+        source = sys.stdin.buffer.read()
+    cid = compute_cid_locally(source)
     print(cid)
     return 0
 
@@ -198,6 +208,13 @@ def _build_parser() -> argparse.ArgumentParser:
     af = sub.add_parser("add-folder", help="Add a directory to IPFS recursively and pin it")
     af.add_argument("path", help="Directory path")
     af.set_defaults(func=_cmd_add_folder)
+
+    cl = sub.add_parser(
+        "compute-cid",
+        help="Print the CID a file would have, without storing or announcing anything",
+    )
+    cl.add_argument("path", help="File path, or '-' to read bytes from stdin")
+    cl.set_defaults(func=_cmd_compute_cid_locally)
 
     g = sub.add_parser("get", help="Retrieve content by CID")
     g.add_argument("cid")

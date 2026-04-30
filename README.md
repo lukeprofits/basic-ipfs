@@ -43,6 +43,11 @@ cid = basic_ipfs.add(b"private data", provide=False)
 cid = basic_ipfs.announce("photo.jpg")
 cid = basic_ipfs.announce(b"temporary data")
 
+# Just compute the CID locally — does NOT store, pin, or announce anything.
+# Useful for previewing the CID of content you have not yet decided to publish.
+cid = basic_ipfs.compute_cid_locally(b"hello world")
+cid = basic_ipfs.compute_cid_locally("photo.jpg")
+
 # Get — returns bytes, or writes to disk if you pass an output path
 data = basic_ipfs.get(cid)
 basic_ipfs.get(cid, "copy.jpg")
@@ -93,6 +98,7 @@ basic-ipfs status
 basic-ipfs add photo.jpg                 # prints the CID, pins content
 basic-ipfs announce photo.jpg            # prints the CID, no pin (may be GC'd)
 basic-ipfs add-folder ./mydir            # recursive add + pin
+basic-ipfs compute-cid photo.jpg         # prints the CID, stores nothing, announces nothing
 basic-ipfs get <cid> [output-path]       # stdout or file
 basic-ipfs pin <cid> [<cid> ...]
 basic-ipfs unpin <cid> [<cid> ...]
