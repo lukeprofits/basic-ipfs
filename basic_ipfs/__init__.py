@@ -898,13 +898,23 @@ class IPFSManager:
     # ---------------- HTTP helpers ----------------
 
     def _is_api_up(self) -> bool:
+        # Confirm the listener on API_HOST:API_PORT is actually a Kubo
+        # daemon, not a stray service that happens to return 200 on POST.
+        # Without this check, a port collision on a shared dev host could
+        # silently route add/pin calls into an unrelated service.
         if self._session is None:
             return False
         try:
             r = self._session.post(f"{self._api_url}/version", timeout=2)
-            return r.status_code == 200
         except Exception:
             return False
+        if r.status_code != 200:
+            return False
+        try:
+            body = r.json()
+        except Exception:
+            return False
+        return isinstance(body, dict) and isinstance(body.get("Version"), str)
 
     def _post(
         self,

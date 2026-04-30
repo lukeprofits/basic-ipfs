@@ -407,6 +407,64 @@ def test_aliases_identity():
 
 
 # ---------------------------------------------------------------------------
+# IPFSManager._is_api_up
+# ---------------------------------------------------------------------------
+
+
+class _StubResponse:
+    def __init__(self, status: int = 200, body=None, raise_json: bool = False):
+        self.status_code = status
+        self._body = body
+        self._raise_json = raise_json
+
+    def json(self):
+        if self._raise_json:
+            raise ValueError("not json")
+        return self._body
+
+
+class _StubSession:
+    def __init__(self, response):
+        self._response = response
+
+    def post(self, *_a, **_kw):
+        return self._response
+
+
+def _manager_with(response):
+    m = basic_ipfs.IPFSManager()
+    m._session = _StubSession(response)
+    m._api_url = "http://127.0.0.1:5001/api/v0"
+    return m
+
+
+def test_is_api_up_true_for_real_kubo_response():
+    m = _manager_with(_StubResponse(200, body={"Version": "0.40.1", "Commit": "abc"}))
+    assert m._is_api_up() is True
+
+
+def test_is_api_up_false_for_non_json_200():
+    """Stray service returns 200 with HTML — must not be mistaken for Kubo."""
+    m = _manager_with(_StubResponse(200, raise_json=True))
+    assert m._is_api_up() is False
+
+
+def test_is_api_up_false_when_version_field_missing():
+    m = _manager_with(_StubResponse(200, body={"Hello": "world"}))
+    assert m._is_api_up() is False
+
+
+def test_is_api_up_false_for_non_200():
+    m = _manager_with(_StubResponse(500, body={"Version": "0.40.1"}))
+    assert m._is_api_up() is False
+
+
+def test_is_api_up_false_when_session_missing():
+    m = basic_ipfs.IPFSManager()
+    assert m._is_api_up() is False
+
+
+# ---------------------------------------------------------------------------
 # Provenance file
 # ---------------------------------------------------------------------------
 
