@@ -87,8 +87,19 @@ What `basic-ipfs` does **not** provide:
   to. There is no Tor or mixnet integration.
 - Content encryption. CIDs are content hashes, not encrypted blobs. If
   you need confidentiality, encrypt before `add()`.
-- Forward-secret identities. Peer ID rotation requires deleting the repo
-  (and therefore your local pin set).
+- Forward-secret identities. `rotate_identity()` issues a new peer ID
+  and preserves the old key in the keystore so you can re-sign IPNS
+  records, but it does **not** retroactively unlink past activity:
+  - Provider records published to the public DHT under the old peer ID
+    remain queryable until they expire (Kubo TTL is ~24 h, sometimes
+    longer in practice).
+  - Connected peers and bootstrap nodes have already observed your IP
+    paired with the old peer ID — rotation does not redact their logs.
+  - Pinned CIDs themselves are unchanged, so any party that previously
+    linked your old peer ID to a content set can still match the new
+    peer ID by re-querying the same CIDs.
+  Rotation severs *future* linkability; treat the previous peer ID as
+  permanently outed for everything you did under it.
 
 ## Manual verification
 
