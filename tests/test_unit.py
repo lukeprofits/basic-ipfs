@@ -709,6 +709,75 @@ def test_iter_multipart_rejects_crlf_in_filename():
         list(gen)  # generator runs lazily — drain to trigger
 
 
+# ---------------------------------------------------------------------------
+# _PinnedRedirectAdapter — host pin enforced at every redirect hop
+# ---------------------------------------------------------------------------
+
+
+def _redirect_adapter():
+    return basic_ipfs._PinnedRedirectAdapter()
+
+
+def _redirect_resp(location: str, status: int = 302):
+    """Build a Response object that requests treats as a redirect."""
+    import requests as _requests
+    resp = _requests.Response()
+    resp.status_code = status
+    resp.headers["Location"] = location
+    resp.url = "https://dist.ipfs.tech/start"
+    return resp
+
+
+def _ok_resp(url: str = "https://dist.ipfs.tech/end"):
+    import requests as _requests
+    resp = _requests.Response()
+    resp.status_code = 200
+    resp.url = url
+    return resp
+
+
+def test_pinned_redirect_adapter_blocks_offsite_hop(monkeypatch):
+    adapter = _redirect_adapter()
+    # Force HTTPAdapter.send to return a 302 → attacker.example, then a 200
+    # if we ever foolishly followed it.
+    calls: list[str] = []
+
+    def fake_send(self, request, **kwargs):
+        calls.append(request.url)
+        if request.url == "https://dist.ipfs.tech/start":
+            return _redirect_resp("https://attacker.example/evil")
+        return _ok_resp(request.url)
+
+    monkeypatch.setattr(
+        basic_ipfs.requests.adapters.HTTPAdapter, "send", fake_send, raising=True
+    )
+    import requests as _requests
+    req = _requests.Request("GET", "https://dist.ipfs.tech/start").prepare()
+    with pytest.raises(basic_ipfs.IPFSBinaryNotFound) as excinfo:
+        adapter.send(req)
+    assert "attacker.example" in str(excinfo.value)
+    # We must have stopped before issuing the request to the attacker.
+    assert "https://attacker.example/evil" not in calls
+
+
+def test_pinned_redirect_adapter_allows_dist_ipfs_tech_hop(monkeypatch):
+    adapter = _redirect_adapter()
+
+    def fake_send(self, request, **kwargs):
+        if request.url == "https://dist.ipfs.tech/start":
+            return _redirect_resp("https://cdn.dist.ipfs.tech/blob")
+        return _ok_resp(request.url)
+
+    monkeypatch.setattr(
+        basic_ipfs.requests.adapters.HTTPAdapter, "send", fake_send, raising=True
+    )
+    import requests as _requests
+    req = _requests.Request("GET", "https://dist.ipfs.tech/start").prepare()
+    resp = adapter.send(req)
+    assert resp.status_code == 200
+    assert resp.url == "https://cdn.dist.ipfs.tech/blob"
+
+
 def test_quote_multipart_filename_preserves_forward_slash():
     """add_folder relies on '/' inside filenames as the path separator."""
     assert basic_ipfs._quote_multipart_filename("a/b/c") == "a/b/c"

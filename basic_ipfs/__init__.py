@@ -325,8 +325,7 @@ def _archive_info() -> tuple[str, str]:
 
 
 def _download_session() -> requests.Session:
-    """A session with retry+backoff on transient HTTP failures."""
-    from requests.adapters import HTTPAdapter
+    """A session with retry+backoff and host-pinned redirects."""
     try:
         from urllib3.util.retry import Retry
     except ImportError:  # very old urllib3
@@ -340,7 +339,7 @@ def _download_session() -> requests.Session:
         allowed_methods=frozenset(["GET", "HEAD"]),
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = _PinnedRedirectAdapter(max_retries=retry)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
     return s
@@ -355,6 +354,48 @@ def _check_redirect_origin(final_url: str) -> None:
         f"Refusing to follow redirect to unexpected host {host!r}. "
         f"Allowed: {', '.join(_ALLOWED_DOWNLOAD_HOSTS)}."
     )
+
+
+class _PinnedRedirectAdapter(requests.adapters.HTTPAdapter):
+    """HTTP adapter that re-checks the host pin at every redirect hop.
+
+    Plain ``allow_redirects=True`` only lets us inspect the *final* URL —
+    a 30x chain through ``attacker.example`` (with valid TLS) would still
+    leak the request headers and User-Agent before landing back on
+    ``dist.ipfs.tech``. Override ``send`` to walk the chain manually,
+    enforcing _check_redirect_origin on each hop's destination before
+    we follow it. The hash check is still fail-closed against bad
+    bytes, but this closes the request-side-channel gap.
+    """
+
+    def send(self, request, **kwargs):  # type: ignore[override]
+        # Disable urllib3-level redirect following so each hop bubbles up
+        # here for inspection. ``requests.Session.resolve_redirects`` will
+        # then iterate over them, and we override its behaviour by
+        # rebuilding the chain ourselves.
+        kwargs["allow_redirects"] = False
+        resp = super().send(request, **kwargs)
+        # Walk redirects up to a sane cap (matches requests' default of 30).
+        seen = 0
+        while resp.is_redirect and seen < 30:
+            seen += 1
+            next_url = resp.headers.get("Location", "")
+            if not next_url:
+                break
+            # Resolve relative redirects against the previous URL.
+            from urllib.parse import urljoin
+            next_url = urljoin(resp.url, next_url)
+            _check_redirect_origin(next_url)
+            # Drop the body and follow.
+            try:
+                resp.close()
+            except Exception:
+                pass
+            new_req = request.copy()
+            new_req.url = next_url
+            # 303 / 302 / 301 on POST → GET, but we only do GET here.
+            resp = super().send(new_req, **kwargs)
+        return resp
 
 
 def _download(url: str, dest: Path, timeout: int = 600) -> str:
