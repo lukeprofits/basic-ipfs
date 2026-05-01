@@ -358,6 +358,22 @@ def test_is_not_pinned_false_when_message_unrelated():
     assert exc.is_not_pinned() is False
 
 
+def test_atexit_handler_registered_only_once(monkeypatch):
+    """Successive stop()/start() cycles must not pile bound-method refs onto
+    atexit — the audit caught a slow leak the previous registration scheme
+    introduced."""
+    seen: list = []
+    monkeypatch.setattr(
+        basic_ipfs.atexit, "register",
+        lambda fn, *a, **kw: seen.append(fn) or fn,
+    )
+    monkeypatch.setattr(basic_ipfs, "_atexit_registered", False)
+    basic_ipfs._ensure_atexit_registered()
+    basic_ipfs._ensure_atexit_registered()
+    basic_ipfs._ensure_atexit_registered()
+    assert len(seen) == 1, f"atexit.register called {len(seen)} times, expected 1"
+
+
 def test_pin_rm_partial_failure_surfaces_failed_cids():
     """A non-`not pinned` failure inside the per-CID fallback must report
     which CIDs succeeded and which didn't, so callers can retry."""

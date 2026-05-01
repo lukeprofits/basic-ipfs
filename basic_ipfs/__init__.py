@@ -876,7 +876,6 @@ class IPFSManager:
         self._log_path: Path | None = None
         self._log_file: io.IOBase | None = None  # writable handle for subprocess stderr
         self._initialised = False
-        self._atexit_registered = False
 
     # ---------------- startup ----------------
 
@@ -906,9 +905,10 @@ class IPFSManager:
         self._start_daemon()
         self._wait_for_api()
 
-        if not self._atexit_registered:
-            atexit.register(self.stop)
-            self._atexit_registered = True
+        # atexit registration is module-scoped (see _ensure_atexit_registered
+        # below) so successive stop()/start() cycles don't accumulate stale
+        # bound-method references on the atexit chain.
+        _ensure_atexit_registered()
 
         self._initialised = True
         logger.info("IPFS node ready — repo: %s", self._repo)
@@ -1216,7 +1216,13 @@ class IPFSManager:
                 raw_type = body.get("Type")
                 if isinstance(raw_type, str):
                     kubo_type = raw_type
-            detail = kubo_message if kubo_message is not None else resp.text
+            # Truncate raw bodies aggressively — a misconfigured reverse
+            # proxy can return multi-MB HTML pages that would otherwise
+            # land in the exception message and the daemon log.
+            raw = resp.text or ""
+            if len(raw) > 1024:
+                raw = raw[:1024] + f"... [truncated {len(raw) - 1024} bytes]"
+            detail = kubo_message if kubo_message is not None else raw
             raise IPFSOperationError(
                 f"IPFS API error [{resp.status_code}] {endpoint}: {detail}",
                 status_code=resp.status_code,
@@ -1564,6 +1570,30 @@ class IPFSManager:
 
 _manager: IPFSManager | None = None
 _start_lock = threading.Lock()
+_atexit_registered = False
+
+
+def _atexit_stop() -> None:
+    """Module-scoped atexit handler — always stops the *current* manager.
+
+    Registered exactly once per process so a long-running supervisor that
+    cycles stop()/start() many times does not accumulate dead bound-method
+    references on the atexit chain.
+    """
+    global _manager
+    if _manager is not None:
+        try:
+            _manager.stop()
+        except Exception:
+            pass
+        _manager = None
+
+
+def _ensure_atexit_registered() -> None:
+    global _atexit_registered
+    if not _atexit_registered:
+        atexit.register(_atexit_stop)
+        _atexit_registered = True
 
 
 def _get_manager() -> IPFSManager:

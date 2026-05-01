@@ -127,6 +127,42 @@ curl -sf https://dist.ipfs.tech/kubo/<version>/kubo_<version>_<platform>.tar.gz.
 Both digests are over the **archive**, not the extracted binary, so to fully
 re-verify you must re-download the archive.
 
+## Loopback API has no authentication
+
+`basic-ipfs` configures Kubo's API to listen on `127.0.0.1:5001` only.
+That endpoint exposes the **full** Kubo HTTP API — `add`, `pin`, `key/*`,
+`config`, `files/*`, etc. — with no token check. Any other process running
+on the same host as the same user (or any other local user that can dial
+loopback) can read your private libp2p key, list pins, swap config, or
+publish content under your peer ID.
+
+This is fine on a single-user dev box. On a **multi-tenant or shared host**
+treat the loopback API as trusted only by your own user, and assume any
+co-tenant who can reach `127.0.0.1:5001` is effectively root over the
+node's IPFS identity. `basic-ipfs` does not currently set
+`API.Authorizations`; if you need that hardening, configure it manually
+via `ipfs config --json API.Authorizations '{...}'` after the first
+init and modify your call sites to send the corresponding header.
+
+## `connect_to_node()` accepts arbitrary multiaddrs
+
+`connect_to_node(multiaddr)` (and `connect_to_nodes`) forwards the
+multiaddr verbatim to the daemon, which will dial it. If a downstream
+service passes user-supplied multiaddrs into this function, the daemon
+becomes an SSRF probe — `/dns/internal-svc.local/tcp/80/...` will reach
+into the local network. `basic-ipfs` does not validate the host. Treat
+the multiaddr argument as untrusted only if your call site already
+validates it.
+
+## `compute_cid_locally()` requires a running daemon
+
+The function is named "locally" because no IPFS-network traffic results
+(Kubo computes the CID and never advertises it), but the implementation
+still routes through the daemon's HTTP API. The first call therefore
+triggers the auto-download of the Kubo binary and starts the daemon.
+This is observable from the local machine (a `ps` listing, an open
+`127.0.0.1:5001` socket) but invisible to the IPFS network.
+
 ## Hardening recommendations
 
 - Set `basic_ipfs.REPO_PATH` to a directory whose mode is `0o700` if other
