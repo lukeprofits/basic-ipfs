@@ -482,6 +482,15 @@ _MAX_DOWNLOAD_BYTES = 2 * _MAX_ARCHIVE_MEMBER_BYTES
 # read back, or set ``MAX_GET_BYTES`` to ``None`` to opt out.
 MAX_GET_BYTES: int | None = 256 * 1024 * 1024
 
+# Default per-request timeout for ``get(cid)``. ``None`` would mean "wait
+# forever," which means an unreachable CID hangs the calling thread until
+# the process is killed — the worst possible failure mode for a library
+# advertised for long-running services. 300 s is high enough that a slow
+# but progressing fetch succeeds and low enough that a stuck swarm fetch
+# fails with a useful exception. Callers who really want unbounded waits
+# can pass ``timeout=None`` per call or override this global.
+DEFAULT_GET_TIMEOUT: float | None = 300.0
+
 
 def _safe_member_name(name: str) -> bool:
     # Defence in depth: extraction never honours the member's path (we always
@@ -1495,15 +1504,20 @@ class IPFSManager:
                 if not exc.is_not_pinned():
                     # Hard failure on the batch — record what was processed
                     # so the caller can retry the rest, then re-raise with
-                    # the partial-success context attached.
-                    raise IPFSOperationError(
+                    # the partial-success context attached. The whole
+                    # current chunk is the "failed" set since Kubo aborts
+                    # an erroring batch atomically.
+                    wrapped = IPFSOperationError(
                         f"pin/rm failed mid-batch after {len(succeeded)} "
                         f"successful unpins: {exc}",
                         status_code=exc.status_code,
                         kubo_code=exc.kubo_code,
                         kubo_type=exc.kubo_type,
                         kubo_message=exc.kubo_message,
-                    ) from exc
+                    )
+                    wrapped.succeeded_cids = succeeded
+                    wrapped.failed_cids = list(chunk)
+                    raise wrapped from exc
                 # One or more CIDs in the batch weren't pinned. Kubo aborts
                 # the whole batch in that case, so fall back to per-CID
                 # removal to preserve idempotency. Track per-CID outcomes
@@ -1684,6 +1698,9 @@ def announce(
     return _get_manager().announce(source, provide=provide, timeout=timeout)
 
 
+_GET_TIMEOUT_DEFAULT = object()
+
+
 @overload
 def get(cid: str) -> bytes: ...
 @overload
@@ -1694,7 +1711,7 @@ def get(
     cid: str,
     output_path: str | os.PathLike[str] | None = None,
     *,
-    timeout: float | None = None,
+    timeout: Any = _GET_TIMEOUT_DEFAULT,
     max_bytes: int | None = -1,
 ) -> bytes | None:
     """Retrieve content by CID.
@@ -1703,10 +1720,10 @@ def get(
     returns ``None``).
 
     ``timeout`` (seconds) bounds how long the daemon may spend fetching the
-    content. With ``timeout=None`` (default) the call inherits Kubo's own
-    behaviour, which is to wait indefinitely for a peer to serve the CID —
-    set a finite value if you want this call to fail fast on unreachable
-    content.
+    content. The default uses ``basic_ipfs.DEFAULT_GET_TIMEOUT`` (300 s
+    out of the box) so an unreachable CID raises rather than hanging the
+    calling thread forever. Pass an explicit ``timeout=None`` to opt
+    out and wait indefinitely.
 
     ``max_bytes`` caps the size of the in-memory return value. The default
     sentinel ``-1`` uses ``basic_ipfs.MAX_GET_BYTES`` (256 MB out of the
@@ -1714,7 +1731,12 @@ def get(
     that's fine letting the OS OOM-kill it). Ignored when ``output_path``
     is set — streaming to disk is unbounded by design.
     """
-    return _get_manager().cat(cid, output_path, timeout=timeout, max_bytes=max_bytes)
+    effective_timeout = (
+        DEFAULT_GET_TIMEOUT if timeout is _GET_TIMEOUT_DEFAULT else timeout
+    )
+    return _get_manager().cat(
+        cid, output_path, timeout=effective_timeout, max_bytes=max_bytes
+    )
 
 
 def pin(cids: str | Iterable[str], *, timeout: float | None = None) -> None:

@@ -397,6 +397,62 @@ def test_start_daemon_raises_ipfs_port_in_use_for_non_kubo_listener(monkeypatch)
         m._start_daemon()
 
 
+def test_get_default_timeout_uses_module_constant(monkeypatch):
+    """get(cid) without an explicit timeout must use DEFAULT_GET_TIMEOUT,
+    not None — otherwise an unreachable CID hangs the calling thread."""
+    captured: dict = {}
+
+    class _FakeMgr:
+        def cat(self, cid, output_path=None, *, timeout=None, max_bytes=-1):
+            captured["timeout"] = timeout
+            return b""
+
+    monkeypatch.setattr(basic_ipfs, "_get_manager", lambda: _FakeMgr())
+    monkeypatch.setattr(basic_ipfs, "DEFAULT_GET_TIMEOUT", 42.0)
+    basic_ipfs.get("bafyFake")
+    assert captured["timeout"] == 42.0
+
+
+def test_get_explicit_none_timeout_opts_out(monkeypatch):
+    captured: dict = {}
+
+    class _FakeMgr:
+        def cat(self, cid, output_path=None, *, timeout=None, max_bytes=-1):
+            captured["timeout"] = timeout
+            return b""
+
+    monkeypatch.setattr(basic_ipfs, "_get_manager", lambda: _FakeMgr())
+    monkeypatch.setattr(basic_ipfs, "DEFAULT_GET_TIMEOUT", 42.0)
+    basic_ipfs.get("bafyFake", timeout=None)
+    assert captured["timeout"] is None
+
+
+def test_pin_rm_hard_batch_failure_carries_succeeded_and_failed(monkeypatch):
+    """When the batch POST itself errors with a non-`not pinned` reason,
+    the wrapped exception must report the whole current chunk as failed
+    plus everything previously processed as succeeded."""
+    m = basic_ipfs.IPFSManager()
+
+    def fake_post(endpoint, *, params=None, **_kw):
+        # Succeed for the first batch (cidA), hard-fail the second (cidB).
+        cids = [v for k, v in (params or []) if k == "arg"]
+        if cids == ["cidB"]:
+            raise basic_ipfs.IPFSOperationError(
+                "kaboom",
+                status_code=500,
+                kubo_type="error",
+                kubo_message="some other failure",
+            )
+        return None
+
+    m._post = fake_post  # type: ignore[assignment]
+    monkeypatch.setattr(basic_ipfs, "_PIN_BATCH_SIZE", 1)
+    with pytest.raises(basic_ipfs.IPFSOperationError) as excinfo:
+        m.pin_rm(["cidA", "cidB"])
+    assert excinfo.value.succeeded_cids == ["cidA"]
+    assert excinfo.value.failed_cids == ["cidB"]
+
+
 def test_atexit_handler_registered_only_once(monkeypatch):
     """Successive stop()/start() cycles must not pile bound-method refs onto
     atexit — the audit caught a slow leak the previous registration scheme
