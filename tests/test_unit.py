@@ -358,6 +358,17 @@ def test_is_not_pinned_false_when_message_unrelated():
     assert exc.is_not_pinned() is False
 
 
+def test_start_daemon_raises_ipfs_port_in_use_for_non_kubo_listener(monkeypatch):
+    """A stray service on API_PORT must surface as IPFSPortInUse, not as
+    a confusing daemon-startup timeout (the audit's port-collision case)."""
+    monkeypatch.setattr(basic_ipfs, "_is_port_in_use", lambda host, port: True)
+    m = basic_ipfs.IPFSManager()
+    # Skip the upstream API check so dispatch reaches the port-collision branch.
+    m._is_api_up = lambda: False  # type: ignore[assignment]
+    with pytest.raises(basic_ipfs.IPFSPortInUse):
+        m._start_daemon()
+
+
 def test_atexit_handler_registered_only_once(monkeypatch):
     """Successive stop()/start() cycles must not pile bound-method refs onto
     atexit — the audit caught a slow leak the previous registration scheme

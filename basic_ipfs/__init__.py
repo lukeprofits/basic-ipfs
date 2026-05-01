@@ -786,6 +786,42 @@ def _iter_multipart(
     return boundary, gen()
 
 
+def _build_api_session() -> requests.Session:
+    """Session for the local Kubo HTTP API.
+
+    Retries connection-level failures only — never status codes, since
+    most Kubo POSTs (`add`, `pin/add`, `pin/rm`) have observable side
+    effects per attempt and a server-side 5xx mid-write means the
+    operation may already have succeeded in part. Connection errors
+    (ECONNREFUSED, broken pipe during a graceful daemon restart) are
+    safe to redrive; they happen mostly when the daemon is migrating
+    its repo or rotating logs.
+    """
+    try:
+        from urllib3.util.retry import Retry
+    except ImportError:  # very old urllib3
+        from requests.packages.urllib3.util.retry import Retry  # type: ignore
+
+    s = requests.Session()
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=0,
+        status=0,
+        backoff_factor=0.25,
+        # `False` means "no method restriction" in urllib3 — connection
+        # errors happen before any request is sent, so retrying every
+        # method is safe. urllib3's type stub for allowed_methods is too
+        # narrow to accept the documented sentinel.
+        allowed_methods=False,  # type: ignore[arg-type]
+        raise_on_status=False,
+    )
+    adapter = requests.adapters.HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+
 def _is_port_in_use(host: str, port: int) -> bool:
     """True if something is accepting on host:port."""
     try:
@@ -885,7 +921,7 @@ class IPFSManager:
 
         self._binary = _find_or_install_kubo()
         self._repo = _get_repo_path()
-        self._session = requests.Session()
+        self._session = _build_api_session()
         # Re-read config every start so callers can change API_HOST/API_PORT
         # between stop() and start().
         self._api_url = f"http://{API_HOST}:{API_PORT}/api/v0"
