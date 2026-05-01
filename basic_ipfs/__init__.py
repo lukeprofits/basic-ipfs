@@ -158,6 +158,12 @@ class IPFSOperationError(IPFSError):
         self.kubo_code = kubo_code
         self.kubo_type = kubo_type
         self.kubo_message = kubo_message
+        # Populated by pin/unpin batch fallbacks when a partial failure
+        # leaves some CIDs processed and others not. Callers can branch on
+        # ``isinstance(exc, IPFSOperationError) and exc.failed_cids`` to
+        # decide what to retry.
+        self.succeeded_cids: list[str] = []
+        self.failed_cids: list[str] = []
 
     def is_not_pinned(self) -> bool:
         """True iff this error is Kubo's ``<cid> is not pinned`` response.
@@ -1187,6 +1193,7 @@ class IPFSManager:
         pin: bool,
         provide: bool = True,
         only_hash: bool = False,
+        timeout: float | None = None,
     ) -> str:
         # Build a single multipart part that streams from disk (or from
         # bytes wrapped in BytesIO). _iter_multipart() ensures the upload
@@ -1239,7 +1246,7 @@ class IPFSManager:
                 params=params,
                 data=body_iter,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-                timeout=None,
+                timeout=timeout,
             )
         finally:
             if hasattr(body, "close"):
@@ -1256,26 +1263,39 @@ class IPFSManager:
         self,
         source: str | bytes | os.PathLike[str],
         provide: bool = True,
+        *,
+        timeout: float | None = None,
     ) -> str:
-        return self._add(source, pin=True, provide=provide)
+        return self._add(source, pin=True, provide=provide, timeout=timeout)
 
     def announce(
         self,
         source: str | bytes | os.PathLike[str],
         provide: bool = True,
+        *,
+        timeout: float | None = None,
     ) -> str:
-        return self._add(source, pin=False, provide=provide)
+        return self._add(source, pin=False, provide=provide, timeout=timeout)
 
     def compute_cid_locally(
         self,
         source: str | bytes | os.PathLike[str],
+        *,
+        timeout: float | None = None,
     ) -> str:
         # only-hash=true is Kubo's "chunk and hash, do not write" mode. No
         # block is stored in the repo, no pin is created, no provider record
         # is announced, no peer ever learns the CID exists.
-        return self._add(source, pin=False, provide=False, only_hash=True)
+        return self._add(
+            source, pin=False, provide=False, only_hash=True, timeout=timeout
+        )
 
-    def add_folder(self, path: str | os.PathLike[str]) -> str:
+    def add_folder(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        timeout: float | None = None,
+    ) -> str:
         src = Path(os.fspath(path)).resolve()
         if not src.is_dir():
             raise NotADirectoryError(f"Not a directory: {src}")
@@ -1311,7 +1331,7 @@ class IPFSManager:
             ],
             data=body_iter,
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            timeout=None,
+            timeout=timeout,
         )
 
         # quieter=true emits only the root entry — but parse defensively in
@@ -1361,36 +1381,73 @@ class IPFSManager:
                 )
         return bytes(buf)
 
-    def pin_add(self, cids: str | Iterable[str]) -> None:
+    def pin_add(
+        self,
+        cids: str | Iterable[str],
+        *,
+        timeout: float | None = None,
+    ) -> None:
         cid_list = _as_str_list(cids)
         for chunk in _chunked(cid_list, _PIN_BATCH_SIZE):
             params = [("arg", c) for c in chunk]
             params.append(("recursive", "true"))
-            self._post("pin/add", params=params, timeout=None)
+            self._post("pin/add", params=params, timeout=timeout)
 
-    def pin_rm(self, cids: str | Iterable[str]) -> None:
+    def pin_rm(
+        self,
+        cids: str | Iterable[str],
+        *,
+        timeout: float | None = 60,
+    ) -> None:
         cid_list = _as_str_list(cids)
+        succeeded: list[str] = []
+        failed: list[tuple[str, str]] = []
         for chunk in _chunked(cid_list, _PIN_BATCH_SIZE):
             try:
                 params = [("arg", c) for c in chunk]
                 params.append(("recursive", "true"))
-                self._post("pin/rm", params=params, timeout=60)
+                self._post("pin/rm", params=params, timeout=timeout)
+                succeeded.extend(chunk)
             except IPFSOperationError as exc:
                 if not exc.is_not_pinned():
-                    raise
-                # One or more CIDs in the batch weren't pinned. Kubo aborts the
-                # whole batch in that case, so fall back to per-CID removal to
-                # preserve idempotency — each swallowed individually.
+                    # Hard failure on the batch — record what was processed
+                    # so the caller can retry the rest, then re-raise with
+                    # the partial-success context attached.
+                    raise IPFSOperationError(
+                        f"pin/rm failed mid-batch after {len(succeeded)} "
+                        f"successful unpins: {exc}",
+                        status_code=exc.status_code,
+                        kubo_code=exc.kubo_code,
+                        kubo_type=exc.kubo_type,
+                        kubo_message=exc.kubo_message,
+                    ) from exc
+                # One or more CIDs in the batch weren't pinned. Kubo aborts
+                # the whole batch in that case, so fall back to per-CID
+                # removal to preserve idempotency. Track per-CID outcomes
+                # so a hard failure mid-fallback surfaces the partial state
+                # to the caller instead of silently leaving half the chunk
+                # unpinned.
                 for c in chunk:
                     try:
                         self._post(
                             "pin/rm",
                             params={"arg": c, "recursive": "true"},
-                            timeout=60,
+                            timeout=timeout,
                         )
+                        succeeded.append(c)
                     except IPFSOperationError as per_exc:
-                        if not per_exc.is_not_pinned():
-                            raise
+                        if per_exc.is_not_pinned():
+                            succeeded.append(c)  # idempotent no-op counts as success
+                            continue
+                        failed.append((c, str(per_exc)))
+        if failed:
+            err = IPFSOperationError(
+                f"unpin partially succeeded: {len(succeeded)} ok, "
+                f"{len(failed)} failed; first failure: {failed[0][1]}"
+            )
+            err.failed_cids = [c for c, _ in failed]
+            err.succeeded_cids = succeeded
+            raise err
 
     def pin_ls(self) -> list[str]:
         resp = self._post("pin/ls", params={"type": "recursive"}, timeout=10).json()
@@ -1422,8 +1479,8 @@ class IPFSManager:
         except (IPFSOperationError, requests.exceptions.Timeout):
             return False
 
-    def repo_gc(self) -> None:
-        self._post("repo/gc", timeout=None)
+    def repo_gc(self, *, timeout: float | None = None) -> None:
+        self._post("repo/gc", timeout=timeout)
 
     def swarm_peers(self) -> list[str]:
         resp = self._post("swarm/peers", timeout=10).json()
@@ -1489,6 +1546,8 @@ def _get_manager() -> IPFSManager:
 def add(
     source: str | bytes | os.PathLike[str],
     provide: bool = True,
+    *,
+    timeout: float | None = None,
 ) -> str:
     """Add a file (path or bytes) to IPFS and pin it. Returns the CID.
 
@@ -1496,20 +1555,26 @@ def add(
     addressable by CID, but its presence on this node is not advertised to
     the public network. Useful for staging private data before deciding
     whether to publish.
+
+    ``timeout`` (seconds) bounds the upload. Default ``None`` waits as
+    long as the daemon needs (right for huge files).
     """
-    return _get_manager().add(source, provide=provide)
+    return _get_manager().add(source, provide=provide, timeout=timeout)
 
 
 def announce(
     source: str | bytes | os.PathLike[str],
     provide: bool = True,
+    *,
+    timeout: float | None = None,
 ) -> str:
     """Add a file (path or bytes) to IPFS without pinning. Returns the CID.
 
     Content is available on the network but may be garbage-collected unless
     pinned later. Pass ``provide=False`` to skip the DHT announce.
+    ``timeout`` (seconds) bounds the upload; default is no timeout.
     """
-    return _get_manager().announce(source, provide=provide)
+    return _get_manager().announce(source, provide=provide, timeout=timeout)
 
 
 @overload
@@ -1545,20 +1610,22 @@ def get(
     return _get_manager().cat(cid, output_path, timeout=timeout, max_bytes=max_bytes)
 
 
-def pin(cids: str | Iterable[str]) -> None:
+def pin(cids: str | Iterable[str], *, timeout: float | None = None) -> None:
     """Recursively pin one or many CIDs so they are never garbage-collected.
 
     Accepts a single CID string or any iterable of CID strings.
+    ``timeout`` (seconds) bounds each batch HTTP call to the daemon.
     """
-    _get_manager().pin_add(cids)
+    _get_manager().pin_add(cids, timeout=timeout)
 
 
-def unpin(cids: str | Iterable[str]) -> None:
+def unpin(cids: str | Iterable[str], *, timeout: float | None = None) -> None:
     """Unpin one or many CIDs. Accepts a single CID string or any iterable.
 
     Idempotent — already-unpinned CIDs are silently skipped.
+    ``timeout`` (seconds) bounds each batch HTTP call to the daemon.
     """
-    _get_manager().pin_rm(cids)
+    _get_manager().pin_rm(cids, timeout=timeout)
 
 
 def get_all_pins() -> list[str]:
@@ -1576,18 +1643,31 @@ def exists(cid: str) -> bool:
     return _get_manager().block_exists(cid)
 
 
-def garbage_collection() -> None:
-    """Trigger Kubo GC, freeing storage used by unpinned content."""
-    _get_manager().repo_gc()
+def garbage_collection(*, timeout: float | None = None) -> None:
+    """Trigger Kubo GC, freeing storage used by unpinned content.
+
+    ``timeout`` (seconds) bounds the GC call; default is no timeout
+    because GC over a large repo is legitimately slow.
+    """
+    _get_manager().repo_gc(timeout=timeout)
 
 
-def add_folder(path: str | os.PathLike[str]) -> str:
-    """Add a directory to IPFS recursively and pin it. Returns the root CID."""
-    return _get_manager().add_folder(path)
+def add_folder(
+    path: str | os.PathLike[str],
+    *,
+    timeout: float | None = None,
+) -> str:
+    """Add a directory to IPFS recursively and pin it. Returns the root CID.
+
+    ``timeout`` (seconds) bounds the upload; default is no timeout.
+    """
+    return _get_manager().add_folder(path, timeout=timeout)
 
 
 def compute_cid_locally(
     source: str | bytes | os.PathLike[str],
+    *,
+    timeout: float | None = None,
 ) -> str:
     """Return the CID a file or bytes payload *would* have, without
     publishing anything.
@@ -1598,10 +1678,16 @@ def compute_cid_locally(
     Useful for previewing the CID of content you have not yet decided
     to publish.
 
+    Note: this routes through the local Kubo daemon's HTTP API, so the
+    daemon must be running (and the binary must be installed). It does
+    not by itself initiate any IPFS-network traffic — Kubo computes the
+    CID locally and never advertises it. ``timeout`` (seconds) bounds
+    the local hash computation; default is no timeout.
+
     Output matches what ``add()`` / ``announce()`` would return for the
     same bytes (CIDv1, default chunker).
     """
-    return _get_manager().compute_cid_locally(source)
+    return _get_manager().compute_cid_locally(source, timeout=timeout)
 
 
 def peers() -> list[str]:

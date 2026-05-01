@@ -358,6 +358,41 @@ def test_is_not_pinned_false_when_message_unrelated():
     assert exc.is_not_pinned() is False
 
 
+def test_pin_rm_partial_failure_surfaces_failed_cids():
+    """A non-`not pinned` failure inside the per-CID fallback must report
+    which CIDs succeeded and which didn't, so callers can retry."""
+    m = basic_ipfs.IPFSManager()
+    calls: list[list[tuple[str, str]]] = []
+
+    def fake_post(endpoint, *, params=None, **_kw):
+        calls.append(list(params))
+        # Treat the batch call as a "not pinned" so we drop into per-CID fallback.
+        if isinstance(params, list) and len([p for p in params if p[0] == "arg"]) > 1:
+            raise basic_ipfs.IPFSOperationError(
+                "batch failed",
+                status_code=500,
+                kubo_type="error",
+                kubo_message="bafy is not pinned",
+            )
+        # Per-CID: succeed for cidA, raise hard for cidB, succeed for cidC.
+        cid = params["arg"] if isinstance(params, dict) else dict(params).get("arg")
+        if cid == "cidB":
+            raise basic_ipfs.IPFSOperationError(
+                "kaboom",
+                status_code=500,
+                kubo_type="error",
+                kubo_message="some other failure",
+            )
+        return None  # success
+
+    m._post = fake_post  # type: ignore[assignment]
+    with pytest.raises(basic_ipfs.IPFSOperationError) as excinfo:
+        m.pin_rm(["cidA", "cidB", "cidC"])
+    assert excinfo.value.failed_cids == ["cidB"]
+    assert "cidA" in excinfo.value.succeeded_cids
+    assert "cidC" in excinfo.value.succeeded_cids
+
+
 def test_is_not_pinned_false_without_error_envelope():
     """An unstructured 502 (e.g. an HTML reverse-proxy page that happens to
     contain the words 'not pinned') must not be treated as a successful no-op."""
