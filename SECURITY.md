@@ -5,7 +5,7 @@ Found a vulnerability? Open a private security advisory on GitHub via the
 <https://github.com/lukeprofits/basic-ipfs/security/advisories/new>). Don't
 open a public issue.
 
-Only the latest released `0.2.x` gets fixes. Upgrade if you're on `0.1.x`.
+Only the latest released `1.x` gets fixes.
 
 ## What `basic-ipfs` actually verifies
 

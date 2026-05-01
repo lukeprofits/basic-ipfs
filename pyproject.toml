@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "basic-ipfs"
-version = "0.2.2"
-description = "Stupid-simple IPFS for Python. Auto-manages a real Kubo node."
+version = "1.0.0"
+description = "An intentionally tiny IPFS library for Python. Auto-manages a real Kubo node."
 readme = "README.md"
 license = { file = "LICENSE" }
-authors = [{ name = "lukeprofits" }]
+authors = [{ name = "Luke Profits" }]
 requires-python = ">=3.9"
 dependencies = [
     "requests>=2.28",
@@ -33,7 +33,7 @@ dev = [
 basic-ipfs = "basic_ipfs.cli:main"
 
 [project.urls]
-Source = "https://github.com/lukeprofits/basic-ipfs"
+Homepage = "https://github.com/lukeprofits/basic-ipfs"
 
 [tool.setuptools.packages.find]
 include = ["basic_ipfs*"]
