@@ -598,6 +598,87 @@ def test_cat_in_memory_unbounded_when_max_bytes_none():
     assert len(out) == 2 * 1024 * 1024
 
 
+# ---------------------------------------------------------------------------
+# Streaming multipart encoder (used by _add and add_folder)
+# ---------------------------------------------------------------------------
+
+
+def _join(it):
+    return b"".join(it)
+
+
+def test_iter_multipart_single_bytes_part():
+    boundary, gen = basic_ipfs._iter_multipart(
+        [("data", "application/octet-stream", b"hello")]
+    )
+    body = _join(gen)
+    assert isinstance(boundary, str) and boundary.startswith("----basic_ipfs_")
+    bb = boundary.encode()
+    assert body.startswith(b"--" + bb + b"\r\n")
+    assert body.endswith(b"--" + bb + b"--\r\n")
+    assert b'Content-Disposition: form-data; name="file"; filename="data"\r\n' in body
+    assert b"Content-Type: application/octet-stream\r\n\r\nhello\r\n" in body
+
+
+def test_iter_multipart_streams_from_path(tmp_path):
+    p = tmp_path / "blob"
+    p.write_bytes(b"x" * (3 << 16))  # 192 KB — multiple read chunks
+    boundary, gen = basic_ipfs._iter_multipart(
+        [("blob", "application/octet-stream", p)]
+    )
+    body = _join(gen)
+    # File contents present verbatim, framed by the boundary footer.
+    assert b"x" * (3 << 16) in body
+    assert body.endswith(b"--" + boundary.encode() + b"--\r\n")
+
+
+def test_iter_multipart_constant_memory_for_large_payload(tmp_path):
+    """The whole point: a huge payload yields chunk-by-chunk, no buffering."""
+    big = tmp_path / "big"
+    big.write_bytes(b"\0" * (4 << 20))  # 4 MB — small enough for CI, big enough to prove chunking
+    _, gen = basic_ipfs._iter_multipart([("big", "application/octet-stream", big)])
+    sizes: list[int] = []
+    for chunk in gen:
+        sizes.append(len(chunk))
+    # Plenty of chunks (at least one per 64 KB read), and no single chunk is
+    # the whole payload — that would mean buffering.
+    assert max(sizes) <= 1 << 16
+    assert sum(sizes) > 4 << 20
+
+
+def test_iter_multipart_directory_part_is_empty():
+    boundary, gen = basic_ipfs._iter_multipart(
+        [("mydir", "application/x-directory", b"")]
+    )
+    body = _join(gen)
+    assert b'filename="mydir"\r\n' in body
+    assert b"Content-Type: application/x-directory\r\n\r\n\r\n" in body
+    assert body.endswith(b"--" + boundary.encode() + b"--\r\n")
+
+
+def test_iter_multipart_quotes_filename_special_chars():
+    """Quote and backslash must be backslash-escaped per RFC 7578 §4.2."""
+    _, gen = basic_ipfs._iter_multipart(
+        [('weird"name\\thing', "application/octet-stream", b"x")]
+    )
+    body = _join(gen)
+    assert b'filename="weird\\"name\\\\thing"' in body
+
+
+def test_iter_multipart_rejects_crlf_in_filename():
+    """CR/LF in a header value would forge a header injection."""
+    with pytest.raises(ValueError):
+        boundary, gen = basic_ipfs._iter_multipart(
+            [("evil\r\nX-Pwn: yes", "application/octet-stream", b"x")]
+        )
+        list(gen)  # generator runs lazily — drain to trigger
+
+
+def test_quote_multipart_filename_preserves_forward_slash():
+    """add_folder relies on '/' inside filenames as the path separator."""
+    assert basic_ipfs._quote_multipart_filename("a/b/c") == "a/b/c"
+
+
 def test_cat_to_disk_is_unbounded(tmp_path):
     """Streaming to disk has no cap — caller already chose to spend disk."""
     resp = _StreamingResponse(total_bytes=4 * 1024 * 1024)

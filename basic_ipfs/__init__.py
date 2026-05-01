@@ -672,6 +672,73 @@ def _addr_score(multiaddr: str) -> int:
     return -1
 
 
+def _quote_multipart_filename(name: str) -> str:
+    # Match what requests/urllib3 send: a literal filename inside double
+    # quotes, with backslash and double-quote backslash-escaped per RFC
+    # 7578 §4.2. CR/LF in a header value would forge a header injection,
+    # so refuse anything that contains them outright. Forward slashes are
+    # preserved — Kubo's add handler treats them as path separators when
+    # building the directory tree, which is exactly what add_folder()
+    # relies on.
+    if "\r" in name or "\n" in name:
+        raise ValueError(f"refusing CR/LF in multipart filename: {name!r}")
+    return name.replace("\\", "\\\\").replace('"', '\\"')
+
+
+# A streaming-multipart "part": (filename, content_type, body) where body
+# is bytes, an os.PathLike (opened lazily and streamed), or a file-like
+# object supporting .read(n). The encoder reads in 64 KB chunks, so RAM
+# usage is constant regardless of total upload size.
+_MULTIPART_PART = tuple
+
+
+def _iter_multipart(
+    parts: list[tuple[str, str, bytes | os.PathLike[str] | io.IOBase]],
+) -> tuple[str, Iterable[bytes]]:
+    """Build a streaming multipart/form-data body.
+
+    Returns the boundary string and a generator that yields the wire body
+    in chunks. Suitable for ``requests.post(data=gen, headers={...})`` —
+    requests will pass through the iterable without buffering, so a
+    100 GB upload uses ~64 KB of RSS regardless of total size. (The
+    legacy ``files=`` path of requests reads every part into memory
+    via ``urllib3.filepost.encode_multipart_formdata``, which is the
+    OOM hazard this replaces.)
+    """
+    # Random boundary unlikely to appear in any input. 16 hex bytes is
+    # ample uniqueness; the leading dashes match what RFC 7578 examples use.
+    boundary = "----basic_ipfs_" + os.urandom(16).hex()
+    boundary_bytes = boundary.encode("ascii")
+
+    def gen() -> Iterable[bytes]:
+        for filename, content_type, body in parts:
+            quoted = _quote_multipart_filename(filename)
+            yield b"--" + boundary_bytes + b"\r\n"
+            yield (
+                f'Content-Disposition: form-data; name="file"; filename="{quoted}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode()
+            if isinstance(body, (bytes, bytearray, memoryview)):
+                yield bytes(body)
+            elif hasattr(body, "read"):
+                while True:
+                    chunk = body.read(1 << 16)
+                    if not chunk:
+                        break
+                    yield chunk
+            else:
+                with open(os.fspath(body), "rb") as fh:
+                    while True:
+                        chunk = fh.read(1 << 16)
+                        if not chunk:
+                            break
+                        yield chunk
+            yield b"\r\n"
+        yield b"--" + boundary_bytes + b"--\r\n"
+
+    return boundary, gen()
+
+
 def _is_port_in_use(host: str, port: int) -> bool:
     """True if something is accepting on host:port."""
     try:
@@ -1070,6 +1137,7 @@ class IPFSManager:
         params: dict[str, Any] | list[tuple[str, Any]] | None = None,
         files: Any | None = None,
         data: Any | None = None,
+        headers: dict[str, str] | None = None,
         stream: bool = False,
         timeout: float | None = 60,
     ) -> requests.Response:
@@ -1077,7 +1145,7 @@ class IPFSManager:
         url = f"{self._api_url}/{endpoint}"
         try:
             resp = self._session.post(
-                url, params=params, files=files, data=data,
+                url, params=params, files=files, data=data, headers=headers,
                 stream=stream, timeout=timeout,
             )
         except requests.ConnectionError as exc:
@@ -1120,10 +1188,14 @@ class IPFSManager:
         provide: bool = True,
         only_hash: bool = False,
     ) -> str:
+        # Build a single multipart part that streams from disk (or from
+        # bytes wrapped in BytesIO). _iter_multipart() ensures the upload
+        # never holds more than 64 KB at a time in RAM, so even a multi-GB
+        # add() is RSS-flat.
+        body: bytes | io.IOBase
         if isinstance(source, (bytes, bytearray, memoryview)):
-            file_obj: io.IOBase = io.BytesIO(bytes(source))
+            body = bytes(source)
             filename = "data"
-            close_after = False
         elif isinstance(source, (str, os.PathLike)):
             path = Path(os.fspath(source))
             if not path.exists():
@@ -1132,9 +1204,11 @@ class IPFSManager:
                 raise IsADirectoryError(
                     f"{path} is a directory — use add_folder() for directories."
                 )
-            file_obj = open(path, "rb")
+            # Hand the open handle to the streaming generator; it closes
+            # after EOF. We intentionally do not use a context manager here
+            # because the generator owns the read lifecycle.
+            body = open(path, "rb")
             filename = path.name
-            close_after = True
         else:
             raise TypeError(
                 f"source must be str, PathLike, or bytes, not {type(source).__name__}"
@@ -1155,16 +1229,24 @@ class IPFSManager:
             # by Kubo when only-hash is set; we still send the same shape so
             # the request is uniform with the regular add path.
             params.append(("only-hash", "true"))
+
+        boundary, body_iter = _iter_multipart(
+            [(filename, "application/octet-stream", body)]
+        )
         try:
             resp = self._post(
                 "add",
                 params=params,
-                files={"file": (filename, file_obj)},
+                data=body_iter,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
                 timeout=None,
             )
         finally:
-            if close_after:
-                file_obj.close()
+            if hasattr(body, "close"):
+                try:
+                    body.close()
+                except Exception:
+                    pass
 
         lines = [ln for ln in resp.text.strip().splitlines() if ln.strip()]
         cid: str = json.loads(lines[-1])["Hash"]
@@ -1198,44 +1280,39 @@ class IPFSManager:
         if not src.is_dir():
             raise NotADirectoryError(f"Not a directory: {src}")
 
-        # Build a multipart body: every directory becomes an empty part with
-        # Content-Type: application/x-directory; every file becomes a regular
-        # part. Filenames are POSIX-style relative paths rooted at src.name,
-        # which makes the response's last entry the CID of src itself.
-        files: list[tuple[str, tuple[str, Any, str]]] = []
-        open_handles: list[Any] = []
-        try:
-            for current_dir, dirnames, filenames in os.walk(src):
-                dirnames.sort()
-                filenames.sort()
-                current_path = Path(current_dir)
-                rel = current_path.relative_to(src)
-                dir_name = src.name if rel == Path(".") else (Path(src.name) / rel).as_posix()
-                files.append(("file", (dir_name, b"", "application/x-directory")))
-                for fname in filenames:
-                    rel_file = (Path(src.name) / rel / fname).as_posix()
-                    fh = open(current_path / fname, "rb")
-                    open_handles.append(fh)
-                    files.append(("file", (rel_file, fh, "application/octet-stream")))
+        # Build the parts list eagerly (cheap — just (name, type, path)
+        # tuples) but defer file opens to _iter_multipart, which opens
+        # each file as it streams it and closes it on EOF. This keeps
+        # the open-FD count at 1 throughout the upload regardless of
+        # how many files are in the tree, dodging both RAM and ulimit
+        # exhaustion that the previous open-everything-up-front
+        # implementation hit on large trees.
+        parts: list[tuple[str, str, bytes | os.PathLike[str] | io.IOBase]] = []
+        for current_dir, dirnames, filenames in os.walk(src):
+            dirnames.sort()
+            filenames.sort()
+            current_path = Path(current_dir)
+            rel = current_path.relative_to(src)
+            dir_name = src.name if rel == Path(".") else (Path(src.name) / rel).as_posix()
+            parts.append((dir_name, "application/x-directory", b""))
+            for fname in filenames:
+                rel_file = (Path(src.name) / rel / fname).as_posix()
+                parts.append((rel_file, "application/octet-stream", current_path / fname))
 
-            resp = self._post(
-                "add",
-                params=[
-                    ("recursive", "true"),
-                    ("wrap-with-directory", "false"),
-                    ("pin", "true"),
-                    ("cid-version", "1"),
-                    ("quieter", "true"),
-                ],
-                files=files,
-                timeout=None,
-            )
-        finally:
-            for fh in open_handles:
-                try:
-                    fh.close()
-                except Exception:
-                    pass
+        boundary, body_iter = _iter_multipart(parts)
+        resp = self._post(
+            "add",
+            params=[
+                ("recursive", "true"),
+                ("wrap-with-directory", "false"),
+                ("pin", "true"),
+                ("cid-version", "1"),
+                ("quieter", "true"),
+            ],
+            data=body_iter,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            timeout=None,
+        )
 
         # quieter=true emits only the root entry — but parse defensively in
         # case Kubo decides to be chatty in a future version.
