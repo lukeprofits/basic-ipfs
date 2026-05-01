@@ -358,6 +358,34 @@ def test_is_not_pinned_false_when_message_unrelated():
     assert exc.is_not_pinned() is False
 
 
+def test_wait_for_api_raises_ipfs_repo_locked_when_log_says_so(tmp_path, monkeypatch):
+    """When the daemon dies with a "lock" / "repo" complaint, surface it as
+    IPFSRepoLocked so callers can branch on a real exception rather than
+    parse the daemon log themselves."""
+    log = tmp_path / "daemon.log"
+    log.write_text(
+        "2025-04-30 12:00:00 INFO starting Kubo\n"
+        "2025-04-30 12:00:01 ERROR lock acquire failed: someone else owns this repo\n"
+    )
+
+    class _DeadProcess:
+        returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+    m = basic_ipfs.IPFSManager()
+    m._repo = tmp_path
+    m._log_path = log
+    m._process = _DeadProcess()  # type: ignore[assignment]
+    m._is_api_up = lambda: False  # type: ignore[assignment]
+    # Tighten the timeout so a regression doesn't waste a minute of CI.
+    monkeypatch.setattr(basic_ipfs, "DAEMON_STARTUP_TIMEOUT", 1)
+    with pytest.raises(basic_ipfs.IPFSRepoLocked) as excinfo:
+        m._wait_for_api()
+    assert "lock" in str(excinfo.value).lower()
+
+
 def test_start_daemon_raises_ipfs_port_in_use_for_non_kubo_listener(monkeypatch):
     """A stray service on API_PORT must surface as IPFSPortInUse, not as
     a confusing daemon-startup timeout (the audit's port-collision case)."""

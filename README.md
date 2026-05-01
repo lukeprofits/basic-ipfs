@@ -218,9 +218,21 @@ Auto-download is verified against an SHA-512 hash baked into the wheel
 (`basic_ipfs/kubo_checksums.py`) using a constant-time compare. Versions
 not in the table are refused — fetching a digest from the same origin as
 the archive adds no real protection, so the install is fail-closed. The
-download also pins its redirect target to `*.ipfs.tech`. See
-[`SECURITY.md`](SECURITY.md) for the full threat model and how to verify
-manually.
+download also pins its redirect target to `*.ipfs.tech` at every hop in
+the chain (not just the final URL).
+
+Two trust assumptions worth knowing before deploying on a shared host:
+
+- **The local Kubo HTTP API on `127.0.0.1:5001` is unauthenticated.**
+  Any process running as the same user can drive the full Kubo API,
+  including `key/*` and `config`. Single-user dev boxes are fine;
+  multi-tenant hosts need additional hardening (`API.Authorizations`).
+- **`connect_to_node(multiaddr)` forwards its argument verbatim.** If
+  your code feeds untrusted input into it, the daemon becomes an SSRF
+  probe.
+
+See [`SECURITY.md`](SECURITY.md) for the full threat model and how to
+verify the binary manually.
 
 ### Privacy
 
