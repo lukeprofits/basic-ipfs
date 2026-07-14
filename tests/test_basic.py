@@ -289,7 +289,19 @@ def test_peers_returns_list():
 
 def test_my_node_multiaddress():
     ipv4, ipv6 = basic_ipfs.my_node_multiaddress()
-    assert ipv4 is not None or ipv6 is not None
+    # On a NAT'd host with only private addresses (e.g. a CI runner), the
+    # `server` init profile stops Kubo announcing private ranges, so
+    # (None, None) is the documented, correct answer. Assert consistency
+    # with the raw announced-address list instead of assuming the host has
+    # something shareable.
+    usable = [
+        a for a in basic_ipfs._get_manager().my_addrs()
+        if basic_ipfs._addr_score(a) >= 0
+    ]
+    if usable:
+        assert ipv4 is not None or ipv6 is not None
+    else:
+        assert ipv4 is None and ipv6 is None
     if ipv4:
         assert ipv4.startswith("/ip4/")
         assert "/p2p/" in ipv4

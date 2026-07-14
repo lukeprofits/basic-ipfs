@@ -50,9 +50,10 @@ def _spawn_node_b(
             "/ip6/::/tcp/{swarm_port}",
         ]
         basic_ipfs.start()
-        # Print readiness sentinel and our address for the parent to consume.
+        # Print readiness sentinel, our address, and peer ID for the parent.
         ipv4, ipv6 = basic_ipfs.my_node_multiaddress()
-        print("READY", json.dumps({{"ipv4": ipv4, "ipv6": ipv6}}), flush=True)
+        peer_id = basic_ipfs.status()["peer_id"]
+        print("READY", json.dumps({{"ipv4": ipv4, "ipv6": ipv6, "peer_id": peer_id}}), flush=True)
         # Stay alive — parent will signal completion by closing stdin.
         try:
             sys.stdin.read()
@@ -91,9 +92,14 @@ def test_two_nodes_share_content(tmp_path):
 
         import json
         info = json.loads(ready_line.split(" ", 1)[1])
-        # Connect A → B
+        # Connect A → B. On a NAT'd host with only private addresses (CI
+        # runners), the `server` profile means B announces nothing shareable
+        # — but both nodes sit on the same machine, so dial B's swarm
+        # listener over loopback directly.
         target = info["ipv4"] or info["ipv6"]
-        assert target, "node B has no shareable multiaddr"
+        if not target:
+            assert info["peer_id"], "node B reported no peer ID"
+            target = f"/ip4/127.0.0.1/tcp/{swarm_port_b}/p2p/{info['peer_id']}"
         basic_ipfs.connect_to_node(target)
 
         # A adds. Use bytes so the add is fast and the CID is deterministic.
@@ -124,3 +130,10 @@ def test_two_nodes_share_content(tmp_path):
             proc.wait(timeout=10)
         except (subprocess.TimeoutExpired, BrokenPipeError):
             proc.kill()
+            proc.wait(timeout=10)
+        finally:
+            # Close the remaining pipes — leaked TextIOWrappers trip
+            # pytest's unraisable-warning collector (filterwarnings=error).
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
