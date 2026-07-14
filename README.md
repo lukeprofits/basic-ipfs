@@ -218,8 +218,9 @@ Auto-download is verified against an SHA-512 hash baked into the wheel
 (`basic_ipfs/kubo_checksums.py`) using a constant-time compare. Versions
 not in the table are refused — fetching a digest from the same origin as
 the archive adds no real protection, so the install is fail-closed. The
-download also pins its redirect target to `*.ipfs.tech` at every hop in
-the chain (not just the final URL).
+download also pins its redirect target to `dist.ipfs.tech` (and its
+subdomains) at every hop in the chain — not just the final URL — and
+requires HTTPS on every hop.
 
 Two trust assumptions worth knowing before deploying on a shared host:
 

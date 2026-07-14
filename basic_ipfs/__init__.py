@@ -45,7 +45,7 @@ import zipfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, TypedDict, Union, overload
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from platformdirs import user_data_dir
@@ -345,8 +345,28 @@ def _download_session() -> requests.Session:
     return s
 
 
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _check_redirect_origin(final_url: str) -> None:
-    host = (urlparse(final_url).hostname or "").lower()
+    parsed = urlparse(final_url)
+    host = (parsed.hostname or "").lower()
+    # Require HTTPS on every hop: a redirect to http:// would downgrade to
+    # plaintext — the SHA-512 check is still fail-closed against bad bytes,
+    # but the request headers would leak on the wire. Loopback is exempt:
+    # it never crosses a wire a MitM can sit on, and it keeps local mirrors
+    # (and the test suite) usable without a test-only knob.
+    if parsed.scheme != "https" and not _is_loopback_host(host):
+        raise IPFSBinaryNotFound(
+            f"Refusing non-HTTPS download URL {final_url!r}. "
+            f"Only https:// (or loopback) is allowed."
+        )
     for allowed in _ALLOWED_DOWNLOAD_HOSTS:
         if host == allowed or host.endswith("." + allowed):
             return
@@ -369,11 +389,12 @@ class _PinnedRedirectAdapter(requests.adapters.HTTPAdapter):
     """
 
     def send(self, request, **kwargs):  # type: ignore[override]
-        # Disable urllib3-level redirect following so each hop bubbles up
-        # here for inspection. ``requests.Session.resolve_redirects`` will
-        # then iterate over them, and we override its behaviour by
-        # rebuilding the chain ourselves.
-        kwargs["allow_redirects"] = False
+        # No redirect-disabling flag is needed here: HTTPAdapter.send never
+        # follows redirects itself (requests calls urllib3's urlopen with
+        # redirect=False; following lives in Session.resolve_redirects), so
+        # each hop naturally returns to this override. Because we consume
+        # the whole chain and return the final response, the session-level
+        # resolver then sees a non-redirect and never re-follows anything.
         resp = super().send(request, **kwargs)
         # Walk redirects up to a sane cap (matches requests' default of 30).
         seen = 0
@@ -383,18 +404,32 @@ class _PinnedRedirectAdapter(requests.adapters.HTTPAdapter):
             if not next_url:
                 break
             # Resolve relative redirects against the previous URL.
-            from urllib.parse import urljoin
             next_url = urljoin(resp.url, next_url)
-            _check_redirect_origin(next_url)
-            # Drop the body and follow.
+            # Drop the body before the origin check so a rejected hop does
+            # not leak the open connection.
             try:
                 resp.close()
             except Exception:
                 pass
+            _check_redirect_origin(next_url)
             new_req = request.copy()
             new_req.url = next_url
             # 303 / 302 / 301 on POST → GET, but we only do GET here.
             resp = super().send(new_req, **kwargs)
+        if resp.is_redirect:
+            # Chain exhausted the hop cap, or a redirect arrived without a
+            # Location header. Returning it would sail past
+            # raise_for_status() (30x < 400) and surface later as a
+            # confusing SHA mismatch — fail here with the real reason.
+            try:
+                resp.close()
+            except Exception:
+                pass
+            raise IPFSBinaryNotFound(
+                f"Refusing download: redirect chain from {request.url} did not "
+                f"resolve after {seen} hops (or a redirect lacked a Location "
+                f"header)."
+            )
         return resp
 
 

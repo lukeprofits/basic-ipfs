@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "basic-ipfs"
-version = "1.0.0"
+version = "1.0.1"
 description = "An intentionally tiny IPFS library for Python. Auto-manages a real Kubo node."
 readme = "README.md"
 license = { file = "LICENSE" }

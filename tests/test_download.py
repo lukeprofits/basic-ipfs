@@ -1,18 +1,27 @@
 """
 Tests for the auto-download path.
 
-`requests` is mocked so we never hit the network. We exercise:
+Most tests mock `requests` so we never hit the public network. We exercise:
   - SHA-512 verification (success, mismatch, missing)
   - Atomic install (no half-written binary on failure)
   - Disk-space preflight
-  - Baked-in vs network-fetched checksum preference
+  - Refusal of Kubo versions with no baked-in checksum (fail-closed)
+
+The "live" tests at the bottom send REAL requests through the real
+`_download_session()` against a local loopback HTTP server — the mocked
+tests can't catch a session/adapter that is broken at the wire level
+(that exact escape shipped in 1.0.0).
 """
 
 from __future__ import annotations
 
 import hashlib
+import http.server
 import io
+import socketserver
 import tarfile
+import threading
+from contextlib import contextmanager
 from unittest import mock
 
 import pytest
@@ -406,3 +415,113 @@ def test_download_rejects_offsite_redirect(temp_install, monkeypatch):
         basic_ipfs._auto_download_kubo(temp_install)
     assert "attacker.example" in str(excinfo.value)
     assert not temp_install.exists()
+
+
+# ---------------------------------------------------------------------------
+# Live tests — real _download_session() against a local loopback HTTP server.
+#
+# These exist because every mocked test above bypasses the session/adapter
+# entirely: 1.0.0 shipped with _PinnedRedirectAdapter passing an
+# `allow_redirects` kwarg that HTTPAdapter.send() rejects, so EVERY real
+# download crashed with TypeError while the whole suite stayed green.
+# ---------------------------------------------------------------------------
+
+_DIRECT_BODY = b"direct-payload"
+_FINAL_BODY = _make_tarball()
+
+
+class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        routes = {
+            "/direct": ("body", _DIRECT_BODY),
+            "/chain": ("redirect", "/hop"),
+            "/hop": ("redirect", "/final"),
+            "/final": ("body", _FINAL_BODY),
+            "/offsite": ("redirect", "http://attacker.example/x"),
+        }
+        kind, value = routes.get(self.path, ("missing", None))
+        if kind == "redirect":
+            self.send_response(302)
+            self.send_header("Location", value)
+            self.end_headers()
+        elif kind == "body":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(value)))
+            self.end_headers()
+            self.wfile.write(value)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):  # keep pytest output clean
+        pass
+
+
+@contextmanager
+def _live_server():
+    srv = socketserver.TCPServer(("127.0.0.1", 0), _RedirectHandler)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def allow_loopback_host(monkeypatch):
+    monkeypatch.setattr(basic_ipfs, "_ALLOWED_DOWNLOAD_HOSTS", ("127.0.0.1",))
+
+
+def test_download_session_live_direct_get(allow_loopback_host):
+    """Regression for 1.0.0: a plain GET through the real session must not
+    blow up inside the adapter (TypeError on the allow_redirects kwarg)."""
+    with _live_server() as base:
+        with basic_ipfs._download_session() as session:
+            with session.get(f"{base}/direct", stream=True, timeout=10) as r:
+                assert r.status_code == 200
+                assert b"".join(r.iter_content(chunk_size=4)) == _DIRECT_BODY
+
+
+def test_download_session_live_follows_pinned_redirects(allow_loopback_host):
+    with _live_server() as base:
+        with basic_ipfs._download_session() as session:
+            with session.get(f"{base}/chain", stream=True, timeout=10) as r:
+                assert r.status_code == 200
+                assert b"".join(r.iter_content(chunk_size=1 << 16)) == _FINAL_BODY
+
+
+def test_download_session_live_rejects_offsite_redirect(allow_loopback_host):
+    with _live_server() as base:
+        with basic_ipfs._download_session() as session:
+            with pytest.raises(IPFSBinaryNotFound) as excinfo:
+                session.get(f"{base}/offsite", stream=True, timeout=10)
+    assert "attacker.example" in str(excinfo.value)
+
+
+def test_download_live_full_flow(allow_loopback_host, tmp_path):
+    """_download() end-to-end over the wire: real session, redirect chain,
+    per-hop origin check, streaming to disk, digest computation."""
+    dest = tmp_path / "archive.partial"
+    with _live_server() as base:
+        digest = basic_ipfs._download(f"{base}/chain", dest, timeout=10)
+    assert digest == hashlib.sha512(_FINAL_BODY).hexdigest()
+    assert dest.read_bytes() == _FINAL_BODY
+
+
+def test_check_redirect_origin_allows_https():
+    basic_ipfs._check_redirect_origin("https://dist.ipfs.tech/kubo/x.tar.gz")
+
+
+def test_check_redirect_origin_rejects_plain_http():
+    with pytest.raises(IPFSBinaryNotFound) as excinfo:
+        basic_ipfs._check_redirect_origin("http://dist.ipfs.tech/kubo/x.tar.gz")
+    assert "https" in str(excinfo.value).lower()
+
+
+def test_check_redirect_origin_allows_loopback_http(monkeypatch):
+    monkeypatch.setattr(basic_ipfs, "_ALLOWED_DOWNLOAD_HOSTS", ("127.0.0.1",))
+    basic_ipfs._check_redirect_origin("http://127.0.0.1:8000/kubo.tar.gz")

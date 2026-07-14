@@ -292,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     except IPFSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, TypeError) as exc:
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

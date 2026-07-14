@@ -4,8 +4,8 @@ Built-in SHA-512 checksums for Kubo binaries.
 Why baked in: if dist.ipfs.tech is compromised, an attacker could swap both
 the archive and its `.sha512` companion file. Verifying against a hash that
 shipped inside the wheel — installed via signed PyPI metadata — closes that
-gap. For unknown versions, we fall back to fetching the .sha512 alongside
-the archive (with an INFO-level log noting the weaker check).
+gap. Versions not in this table are refused outright (fail-closed): fetching
+a digest from the same origin as the archive would add no protection.
 
 To populate a new version: ``python scripts/refresh_checksums.py <version>``
 """
