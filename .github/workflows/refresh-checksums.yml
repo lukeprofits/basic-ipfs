@@ -80,9 +80,13 @@ jobs:
           if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
             echo "PR for $BRANCH already exists; force-push above updated it."
           else
+            # NOTE: PR creation needs the repo setting "Allow GitHub Actions
+            # to create and approve pull requests" (Settings → Actions →
+            # General → Workflow permissions). Without it, this 403s even
+            # though the workflow requests pull-requests: write.
             gh pr create \
               --base main \
               --head "$BRANCH" \
               --title "Refresh Kubo checksums for $TARGET" \
-              --body "Automated refresh.\n\nRun \`scripts/refresh_checksums.py $TARGET\` and verified the dist.ipfs.tech and github.com release assets returned identical SHA-512 digests for every supported platform. Bump \`KUBO_VERSION\` in \`basic_ipfs/__init__.py\` in a follow-up commit before tagging a release."
+              --body "$(printf 'Automated refresh.\n\nRan `scripts/refresh_checksums.py %s` and verified the dist.ipfs.tech and github.com release assets returned identical SHA-512 digests for every supported platform. Bump `KUBO_VERSION` in `basic_ipfs/__init__.py` in a follow-up commit before tagging a release.' "$TARGET")"
           fi
