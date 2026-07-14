@@ -1217,6 +1217,13 @@ class IPFSManager:
                     self._process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._process.kill()
+                    # Reap the SIGKILLed child — without this the returncode
+                    # stays unset, the process lingers as a zombie until GC,
+                    # and Popen.__del__ emits a ResourceWarning.
+                    try:
+                        self._process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
 
         self._close_session_and_log()
         self._owns_daemon = False
