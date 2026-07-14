@@ -92,9 +92,20 @@ jobs:
           path: ${{ steps.kubo-path.outputs.dir }}
           key: kubo-userdir-${{ runner.os }}-${{ runner.arch }}-v0.40.1
       - name: Basic + concurrency tests
-        run: pytest tests/test_basic.py tests/test_concurrency.py -v
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest tests/test_basic.py tests/test_concurrency.py -v 2>&1 | tee pytest-out.txt
         env:
           PYTHONUNBUFFERED: "1"
+      - name: Surface failure output as annotation
+        # Failed-step logs need repo admin rights via the API; annotations
+        # are public. Mirror the tail of the pytest output into one so
+        # failures are diagnosable without log access.
+        if: failure()
+        shell: bash
+        run: |
+          tail -c 3000 pytest-out.txt | python3 -c "import sys; print('::error::E2E-TAIL ' + sys.stdin.read().replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
 
   e2e-two-node:
     # Inter-node fetch is the load-bearing claim of the library, so make
@@ -121,10 +132,18 @@ jobs:
           path: ${{ steps.kubo-path.outputs.dir }}
           key: kubo-userdir-${{ runner.os }}-${{ runner.arch }}-v0.40.1
       - name: Two-node integration test
-        run: pytest tests/test_two_node.py -v
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest tests/test_two_node.py -v 2>&1 | tee pytest-out.txt
         env:
           IPFS_E2E: "1"
           PYTHONUNBUFFERED: "1"
+      - name: Surface failure output as annotation
+        if: failure()
+        shell: bash
+        run: |
+          tail -c 3000 pytest-out.txt | python3 -c "import sys; print('::error::E2E-TAIL ' + sys.stdin.read().replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
 
   build:
     name: build wheel
