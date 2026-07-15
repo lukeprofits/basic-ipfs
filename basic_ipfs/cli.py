@@ -63,7 +63,7 @@ def _cmd_announce(args: argparse.Namespace) -> int:
 
 
 def _cmd_add_folder(args: argparse.Namespace) -> int:
-    cid = add_folder(args.path)
+    cid = add_folder(args.path, hidden=args.hidden)
     print(cid)
     return 0
 
@@ -207,6 +207,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     af = sub.add_parser("add-folder", help="Add a directory to IPFS recursively and pin it")
     af.add_argument("path", help="Directory path")
+    af.add_argument(
+        "--hidden", action="store_true",
+        help="Include hidden (dot-prefixed) files and directories (skipped by default, like `ipfs add -r`)",
+    )
     af.set_defaults(func=_cmd_add_folder)
 
     cl = sub.add_parser(

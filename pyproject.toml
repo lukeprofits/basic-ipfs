@@ -77,7 +77,7 @@ ignore = ["E501", "S101", "S603", "S607"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S"]
 # basic_ipfs/__init__.py uses `from __future__ import annotations` and then
-# `del Any, Iterable, Union` to keep the public namespace clean — annotations
+# `del Any, Iterable` to keep the public namespace clean — annotations
 # are lazy (PEP 563) so the deletion is safe, but ruff's F821 cannot tell.
 # S110 = best-effort cleanup with bare except-pass; intentional.
 "basic_ipfs/__init__.py" = ["F821", "S110"]

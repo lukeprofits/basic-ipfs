@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from unittest import mock
 
 import pytest
+import requests
 
 import basic_ipfs
 from basic_ipfs import (
@@ -902,3 +904,156 @@ def test_cat_to_disk_is_unbounded(tmp_path):
     result = m.cat("bafyFake", out_path, max_bytes=1)  # cap ignored
     assert result is None
     assert out_path.stat().st_size == 4 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# requests exceptions must surface as IPFSError (documented contract)
+# ---------------------------------------------------------------------------
+
+
+class _ExplodingStream(_StreamingResponse):
+    """Yields one chunk, then dies the way a broken daemon connection does."""
+
+    def iter_content(self, chunk_size=1 << 14):
+        yield b"x" * 1024
+        raise requests.exceptions.ChunkedEncodingError("connection broke")
+
+
+def test_post_wraps_timeout_as_ipfs_error():
+    """get() on an unreachable CID hits DEFAULT_GET_TIMEOUT — that must raise
+    IPFSOperationError, not a raw requests.ReadTimeout (README promises all
+    failures raise IPFSError; the CLI turns IPFSError into a clean message)."""
+
+    class _TimeoutSession:
+        def post(self, *_a, **_kw):
+            raise requests.exceptions.ReadTimeout("read timed out")
+
+    m = basic_ipfs.IPFSManager()
+    m._session = _TimeoutSession()  # type: ignore[assignment]
+    m._api_url = "http://127.0.0.1:5001/api/v0"
+    with pytest.raises(basic_ipfs.IPFSOperationError) as excinfo:
+        m._post("cat", timeout=5)
+    assert "timed out" in str(excinfo.value)
+
+
+def test_cat_to_disk_stream_failure_wraps_and_removes_partial(tmp_path):
+    """A stream dying mid-write must raise IPFSError and not leave a
+    truncated output file a later reader could mistake for the real thing."""
+    m = _cat_manager(_ExplodingStream(total_bytes=0))
+    out = tmp_path / "out.bin"
+    with pytest.raises(basic_ipfs.IPFSOperationError):
+        m.cat("bafyFake", out)
+    assert not out.exists()
+
+
+def test_cat_in_memory_stream_failure_raises_ipfs_error():
+    m = _cat_manager(_ExplodingStream(total_bytes=0))
+    with pytest.raises(basic_ipfs.IPFSOperationError):
+        m.cat("bafyFake")
+
+
+# ---------------------------------------------------------------------------
+# add_folder — hidden-file handling (matches `ipfs add -r` defaults)
+# ---------------------------------------------------------------------------
+
+
+def _add_folder_body(tmp_path, **kwargs) -> bytes:
+    """Run add_folder against a stubbed _post; return the multipart body."""
+    m = basic_ipfs.IPFSManager()
+    captured: dict = {}
+
+    class _Resp:
+        text = '{"Hash": "bafyfakefolder"}'
+
+    def fake_post(endpoint, *, params=None, data=None, headers=None, timeout=None):
+        captured["body"] = b"".join(data)
+        return _Resp()
+
+    m._post = fake_post  # type: ignore[assignment]
+    cid = m.add_folder(tmp_path, **kwargs)
+    assert cid == "bafyfakefolder"
+    return captured["body"]
+
+
+def test_add_folder_skips_hidden_by_default(tmp_path):
+    """Dotfiles are excluded, like `ipfs add -r`. Otherwise macOS Finder
+    droppings (.DS_Store) get published and the same tree hashes to a
+    different CID on macOS than on Linux."""
+    (tmp_path / "visible.txt").write_bytes(b"visible")
+    (tmp_path / ".DS_Store").write_bytes(b"finder junk")
+    hidden_dir = tmp_path / ".git"
+    hidden_dir.mkdir()
+    (hidden_dir / "config").write_bytes(b"repo internals")
+
+    body = _add_folder_body(tmp_path)
+    assert b"visible.txt" in body
+    assert b".DS_Store" not in body
+    assert b".git" not in body
+    assert b"repo internals" not in body
+
+
+def test_add_folder_hidden_true_includes_dotfiles(tmp_path):
+    (tmp_path / "visible.txt").write_bytes(b"visible")
+    (tmp_path / ".well-known").mkdir()
+    (tmp_path / ".well-known" / "x").write_bytes(b"wk")
+
+    body = _add_folder_body(tmp_path, hidden=True)
+    assert b"visible.txt" in body
+    assert b".well-known" in body
+
+
+# ---------------------------------------------------------------------------
+# start() failure must not leak a spawned daemon
+# ---------------------------------------------------------------------------
+
+
+def test_start_failure_kills_spawned_daemon(tmp_path, monkeypatch):
+    """If start() spawns Kubo but the API never comes up (e.g. a slow repo
+    migration blowing past DAEMON_STARTUP_TIMEOUT), the spawned process must
+    be terminated — otherwise it outlives us holding the repo lock + ports."""
+
+    class _FakeProc:
+        pid = 12345
+
+        def __init__(self):
+            self.terminated = False
+            self.killed = False
+            self._rc: int | None = None
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self.terminated = True
+            self._rc = -15
+
+        def kill(self):
+            self.killed = True
+            self._rc = -9
+
+        def wait(self, timeout=None):
+            if self._rc is None:
+                raise subprocess.TimeoutExpired("ipfs", timeout)
+            return self._rc
+
+    fake = _FakeProc()
+    monkeypatch.setattr(basic_ipfs, "_find_or_install_kubo", lambda: tmp_path / "ipfs")
+    monkeypatch.setattr(basic_ipfs, "REPO_PATH", tmp_path / "repo")
+    monkeypatch.setattr(basic_ipfs, "_is_port_in_use", lambda h, p: False)
+    monkeypatch.setattr(basic_ipfs.subprocess, "Popen", lambda *a, **kw: fake)
+    monkeypatch.setattr(basic_ipfs, "DAEMON_STARTUP_TIMEOUT", 0)
+
+    m = basic_ipfs.IPFSManager()
+    m._ensure_repo = lambda: None  # type: ignore[assignment]
+    m._run_cli = lambda *a, **kw: None  # type: ignore[assignment]
+    m._is_api_up = lambda: False  # type: ignore[assignment]
+    m._open_daemon_log = lambda: None  # type: ignore[assignment]
+
+    with pytest.raises(basic_ipfs.IPFSDaemonTimeout):
+        m.start()
+
+    assert fake.terminated, "spawned daemon must be terminated on failed start"
+    assert fake.poll() is not None, "daemon must actually be down"
+    assert m._process is None
+    assert m._owns_daemon is False
+    assert m._initialised is False

@@ -33,7 +33,6 @@ import os
 import platform
 import re
 import shutil
-import signal
 import socket
 import stat
 import subprocess
@@ -44,7 +43,7 @@ import time
 import zipfile
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, TypedDict, Union, overload
+from typing import Any, TypedDict, overload
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -264,7 +263,7 @@ def _platform_key() -> str:
         if machine in ("amd64", "x86_64"):
             return "windows-amd64"
 
-    manual = Path(user_data_dir(APP_NAME)) / "bin" / f"{system}-{machine}" / "ipfs"
+    manual = Path(user_data_dir(APP_NAME)) / "bin" / f"{system}-{machine}" / _binary_name()
     raise IPFSBinaryNotFound(
         f"Unsupported platform: {system}/{machine}.\n"
         f"  Supported: {', '.join(_SUPPORTED_TRIPLES)}.\n"
@@ -668,7 +667,33 @@ def _find_or_install_kubo() -> Path:
     is on PATH or download a fresh copy. The downloader always writes
     to the user_data_dir path — never into site-packages.
     """
-    user = _user_binary_path()
+    try:
+        user = _user_binary_path()
+    except IPFSBinaryNotFound:
+        # Unsupported platform (musl, 32-bit ARM, exotic OS/arch):
+        # _platform_key() raises, which would make the lookup below
+        # unreachable — including the two escape hatches the error message
+        # itself promises. Honour them here: a manually placed binary at
+        # the advertised user_data_dir path, then `ipfs` on PATH. Only
+        # then re-raise; auto-download can never work on these platforms.
+        system = platform.system().lower()
+        machine = platform.machine().lower()
+        manual = (
+            Path(user_data_dir(APP_NAME)) / "bin"
+            / f"{system}-{machine}" / _binary_name()
+        )
+        if manual.exists():
+            try:
+                manual.chmod(manual.stat().st_mode | stat.S_IEXEC)
+            except OSError as exc:
+                logger.warning("could not chmod %s: %s", manual, exc)
+            return manual
+        on_path = shutil.which("ipfs")
+        if on_path:
+            logger.info("Using system-installed Kubo at %s", on_path)
+            return Path(on_path)
+        raise
+
     if user.exists():
         try:
             user.chmod(user.stat().st_mode | stat.S_IEXEC)
@@ -774,13 +799,6 @@ def _quote_multipart_filename(name: str) -> str:
     if "\r" in name or "\n" in name:
         raise ValueError(f"refusing CR/LF in multipart filename: {name!r}")
     return name.replace("\\", "\\\\").replace('"', '\\"')
-
-
-# A streaming-multipart "part": (filename, content_type, body) where body
-# is bytes, an os.PathLike (opened lazily and streamed), or a file-like
-# object supporting .read(n). The encoder reads in 64 KB chunks, so RAM
-# usage is constant regardless of total upload size.
-_MULTIPART_PART = tuple
 
 
 def _iter_multipart(
@@ -962,28 +980,36 @@ class IPFSManager:
     def start(self) -> None:
         if self._initialised:
             return
+        try:
+            self._binary = _find_or_install_kubo()
+            self._repo = _get_repo_path()
+            self._session = _build_api_session()
+            # Re-read config every start so callers can change API_HOST/API_PORT
+            # between stop() and start().
+            self._api_url = f"http://{API_HOST}:{API_PORT}/api/v0"
 
-        self._binary = _find_or_install_kubo()
-        self._repo = _get_repo_path()
-        self._session = _build_api_session()
-        # Re-read config every start so callers can change API_HOST/API_PORT
-        # between stop() and start().
-        self._api_url = f"http://{API_HOST}:{API_PORT}/api/v0"
+            self._ensure_repo()
 
-        self._ensure_repo()
+            # Apply config to the on-disk repo, but only if no daemon is already
+            # running — we don't want to edit another process's live config out
+            # from under it.
+            if not self._is_api_up():
+                self._configure_api_address()
+                self._configure_gateway_address()
+                self._configure_storage_limit()
+                self._configure_swarm_addresses()
 
-        # Apply config to the on-disk repo, but only if no daemon is already
-        # running — we don't want to edit another process's live config out
-        # from under it.
-        if not self._is_api_up():
-            self._configure_api_address()
-            self._configure_gateway_address()
-            self._configure_storage_limit()
-            self._configure_swarm_addresses()
-
-        _swarm_key_warn_if_world_readable()
-        self._start_daemon()
-        self._wait_for_api()
+            _swarm_key_warn_if_world_readable()
+            self._start_daemon()
+            self._wait_for_api()
+        except BaseException:
+            # A half-completed start must not leak the daemon we may have
+            # just spawned: a startup failure after Popen (e.g. a slow
+            # repo migration blowing past DAEMON_STARTUP_TIMEOUT) would
+            # otherwise leave an orphaned Kubo holding the repo lock and
+            # ports long after this process exits.
+            self._abort_start()
+            raise
 
         # atexit registration is module-scoped (see _ensure_atexit_registered
         # below) so successive stop()/start() cycles don't accumulate stale
@@ -992,6 +1018,24 @@ class IPFSManager:
 
         self._initialised = True
         logger.info("IPFS node ready — repo: %s", self._repo)
+
+    def _abort_start(self) -> None:
+        """Roll back a partially-completed start()."""
+        proc = self._process
+        if self._owns_daemon and proc is not None:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            self._process = None
+            self._owns_daemon = False
+        self._close_session_and_log()
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -1035,6 +1079,10 @@ class IPFSManager:
             except subprocess.CalledProcessError as exc:
                 raise IPFSError(
                     f"Failed to initialise IPFS repo at {self._repo}: {exc.stderr.strip()}"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise IPFSError(
+                    f"`ipfs init` timed out initialising the repo at {self._repo}."
                 ) from exc
             return
 
@@ -1209,10 +1257,8 @@ class IPFSManager:
             try:
                 self._process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                if sys.platform == "win32":
-                    self._process.terminate()
-                else:
-                    self._process.send_signal(signal.SIGTERM)
+                # SIGTERM on POSIX, TerminateProcess on Windows.
+                self._process.terminate()
                 try:
                     self._process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
@@ -1282,6 +1328,16 @@ class IPFSManager:
                 url, params=params, files=files, data=data, headers=headers,
                 stream=stream, timeout=timeout,
             )
+        except requests.Timeout as exc:
+            # Wrap so the documented contract ("all failures raise
+            # IPFSError") holds for the library's advertised failure mode —
+            # an unreachable CID hitting DEFAULT_GET_TIMEOUT. Ordered before
+            # ConnectionError because ConnectTimeout subclasses both.
+            raise IPFSOperationError(
+                f"IPFS API call {endpoint!r} timed out after {timeout}s. "
+                f"Pass a larger timeout (or timeout=None) if the operation "
+                f"is legitimately slow."
+            ) from exc
         except requests.ConnectionError as exc:
             raise IPFSOperationError(
                 f"Cannot reach IPFS daemon at {url}. Is it running?"
@@ -1428,6 +1484,7 @@ class IPFSManager:
         self,
         path: str | os.PathLike[str],
         *,
+        hidden: bool = False,
         timeout: float | None = None,
     ) -> str:
         src = Path(os.fspath(path)).resolve()
@@ -1443,6 +1500,13 @@ class IPFSManager:
         # implementation hit on large trees.
         parts: list[tuple[str, str, bytes | os.PathLike[str] | io.IOBase]] = []
         for current_dir, dirnames, filenames in os.walk(src):
+            if not hidden:
+                # Skip dot-prefixed entries, matching `ipfs add -r`'s
+                # default. Without this, macOS Finder droppings (.DS_Store,
+                # ._* AppleDouble files) get published and the same tree
+                # hashes to a different CID on macOS than on Linux.
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                filenames = [f for f in filenames if not f.startswith(".")]
             dirnames.sort()
             filenames.sort()
             current_path = Path(current_dir)
@@ -1490,29 +1554,47 @@ class IPFSManager:
         # malicious / oversized CID can't OOM a long-running service.
         resp = self._post("cat", params={"arg": cid}, stream=True, timeout=timeout)
         if output_path is not None:
-            with open(os.fspath(output_path), "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1 << 16):
-                    fh.write(chunk)
+            out_path = Path(os.fspath(output_path))
+            try:
+                with open(out_path, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=1 << 16):
+                        fh.write(chunk)
+            except requests.RequestException as exc:
+                # Stream died mid-write (read timeout, daemon restart).
+                # Remove the truncated file so a later reader can't mistake
+                # half a payload for the real content.
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+                raise IPFSOperationError(
+                    f"Stream of CID {cid} failed mid-transfer: {exc}"
+                ) from exc
             return None
         # Sentinel ``-1`` means "use the module default"; explicit ``None``
         # means "no cap" so callers who really want unbounded bytes can opt
         # out without monkey-patching the module global.
         cap = MAX_GET_BYTES if max_bytes == -1 else max_bytes
         buf = bytearray()
-        for chunk in resp.iter_content(chunk_size=1 << 16):
-            if not chunk:
-                continue
-            buf.extend(chunk)
-            if cap is not None and len(buf) > cap:
-                # Abort the stream rather than continue reading; close the
-                # connection so we don't keep the daemon writing.
-                resp.close()
-                raise IPFSOperationError(
-                    f"Refusing to load CID {cid} into memory: exceeds "
-                    f"{cap} bytes (already received {len(buf)}). "
-                    f"Pass an output_path to stream to disk, or set "
-                    f"basic_ipfs.MAX_GET_BYTES = None / a larger value."
-                )
+        try:
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if cap is not None and len(buf) > cap:
+                    # Abort the stream rather than continue reading; close the
+                    # connection so we don't keep the daemon writing.
+                    resp.close()
+                    raise IPFSOperationError(
+                        f"Refusing to load CID {cid} into memory: exceeds "
+                        f"{cap} bytes (already received {len(buf)}). "
+                        f"Pass an output_path to stream to disk, or set "
+                        f"basic_ipfs.MAX_GET_BYTES = None / a larger value."
+                    )
+        except requests.RequestException as exc:
+            raise IPFSOperationError(
+                f"Stream of CID {cid} failed mid-transfer: {exc}"
+            ) from exc
         return bytes(buf)
 
     def pin_add(
@@ -1826,13 +1908,21 @@ def garbage_collection(*, timeout: float | None = None) -> None:
 def add_folder(
     path: str | os.PathLike[str],
     *,
+    hidden: bool = False,
     timeout: float | None = None,
 ) -> str:
     """Add a directory to IPFS recursively and pin it. Returns the root CID.
 
+    Hidden entries (dot-prefixed files and directories, e.g. ``.DS_Store``,
+    ``.git``) are skipped by default, matching ``ipfs add -r``. This keeps
+    the CID stable across platforms — a macOS folder littered with Finder
+    metadata hashes the same as the clean tree on Linux — and avoids
+    publishing junk. Pass ``hidden=True`` to include them (e.g. a static
+    site that needs ``.well-known/``).
+
     ``timeout`` (seconds) bounds the upload; default is no timeout.
     """
-    return _get_manager().add_folder(path, timeout=timeout)
+    return _get_manager().add_folder(path, hidden=hidden, timeout=timeout)
 
 
 def compute_cid_locally(
@@ -2155,6 +2245,8 @@ def rotate_identity(oldkey_name: str = "previous-self") -> str:
         raise IPFSError(
             f"Failed to rotate identity: {exc.stderr.strip()}"
         ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise IPFSError("`ipfs key rotate` timed out after 30s.") from exc
     try:
         config = json.loads((repo / "config").read_text())
         new_id: str = config["Identity"]["PeerID"]
@@ -2224,6 +2316,10 @@ def lockdown_mode() -> None:
             raise IPFSError(
                 f"Failed to set {label} during lockdown_mode: {exc.stderr.strip()}"
             ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise IPFSError(
+                f"Timed out setting {label} during lockdown_mode."
+            ) from exc
     logger.info("lockdown_mode applied — node will not talk to public IPFS.")
 
 
@@ -2268,4 +2364,4 @@ __all__ = [
 # and don't need to live in the module namespace at runtime. Hide them so
 # `basic_ipfs.<TAB>` doesn't surface them. (Path / TypedDict / overload are
 # kept — they're used at runtime.)
-del Any, Iterable, Union
+del Any, Iterable

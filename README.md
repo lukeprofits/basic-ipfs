@@ -97,7 +97,7 @@ Installing the package also adds a `basic-ipfs` command:
 basic-ipfs status
 basic-ipfs add photo.jpg                 # prints the CID, pins content
 basic-ipfs announce photo.jpg            # prints the CID, no pin (may be GC'd)
-basic-ipfs add-folder ./mydir            # recursive add + pin
+basic-ipfs add-folder ./mydir            # recursive add + pin (skips dotfiles; --hidden includes them)
 basic-ipfs compute-cid photo.jpg         # prints the CID, stores nothing, announces nothing
 basic-ipfs get <cid> [output-path]       # stdout or file
 basic-ipfs pin <cid> [<cid> ...]

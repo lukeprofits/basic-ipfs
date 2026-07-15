@@ -22,6 +22,7 @@ import socketserver
 import tarfile
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -383,6 +384,56 @@ def test_find_or_install_downloads_into_user_dir(tmp_path, monkeypatch):
     assert resolved == user
     assert captured["dest"] == user
     assert not bundled.exists()
+
+
+def test_find_or_install_unsupported_platform_uses_manual_binary(tmp_path, monkeypatch):
+    """On a platform Kubo doesn't publish for, the error message promises a
+    manual-placement path — _find_or_install_kubo must actually honour it
+    instead of raising from _platform_key() before ever looking."""
+    monkeypatch.setattr(basic_ipfs.platform, "system", lambda: "Plan9")
+    monkeypatch.setattr(basic_ipfs.platform, "machine", lambda: "weirdarch")
+    monkeypatch.setattr(basic_ipfs, "user_data_dir", lambda app: str(tmp_path))
+    manual = tmp_path / "bin" / "plan9-weirdarch" / "ipfs"
+    manual.parent.mkdir(parents=True)
+    manual.write_text("#!/bin/sh\necho manual\n")
+
+    assert basic_ipfs._find_or_install_kubo() == manual
+
+
+def test_find_or_install_musl_manual_binary(tmp_path, monkeypatch):
+    """Same promise for Alpine/musl: the error message names
+    bin/linux-<machine>/ipfs — a binary placed there must be used."""
+    monkeypatch.setattr(basic_ipfs.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(basic_ipfs.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(basic_ipfs, "_is_musl", lambda: True)
+    monkeypatch.setattr(basic_ipfs, "user_data_dir", lambda app: str(tmp_path))
+    manual = tmp_path / "bin" / "linux-x86_64" / "ipfs"
+    manual.parent.mkdir(parents=True)
+    manual.write_text("#!/bin/sh\necho musl\n")
+
+    assert basic_ipfs._find_or_install_kubo() == manual
+
+
+def test_find_or_install_unsupported_platform_falls_back_to_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(basic_ipfs.platform, "system", lambda: "Plan9")
+    monkeypatch.setattr(basic_ipfs.platform, "machine", lambda: "weirdarch")
+    monkeypatch.setattr(basic_ipfs, "user_data_dir", lambda app: str(tmp_path))
+    monkeypatch.setattr(basic_ipfs.shutil, "which", lambda _: "/opt/kubo/ipfs")
+
+    assert basic_ipfs._find_or_install_kubo() == Path("/opt/kubo/ipfs")
+
+
+def test_find_or_install_unsupported_platform_raises_without_escape(tmp_path, monkeypatch):
+    """No manual binary, nothing on PATH — the original helpful error
+    (with the manual path in it) must still surface."""
+    monkeypatch.setattr(basic_ipfs.platform, "system", lambda: "Plan9")
+    monkeypatch.setattr(basic_ipfs.platform, "machine", lambda: "weirdarch")
+    monkeypatch.setattr(basic_ipfs, "user_data_dir", lambda app: str(tmp_path))
+    monkeypatch.setattr(basic_ipfs.shutil, "which", lambda _: None)
+
+    with pytest.raises(IPFSBinaryNotFound) as excinfo:
+        basic_ipfs._find_or_install_kubo()
+    assert "plan9/weirdarch" in str(excinfo.value).lower()
 
 
 def test_download_rejects_offsite_redirect(temp_install, monkeypatch):
