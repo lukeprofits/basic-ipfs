@@ -393,7 +393,9 @@ def test_find_or_install_unsupported_platform_uses_manual_binary(tmp_path, monke
     monkeypatch.setattr(basic_ipfs.platform, "system", lambda: "Plan9")
     monkeypatch.setattr(basic_ipfs.platform, "machine", lambda: "weirdarch")
     monkeypatch.setattr(basic_ipfs, "user_data_dir", lambda app: str(tmp_path))
-    manual = tmp_path / "bin" / "plan9-weirdarch" / "ipfs"
+    # _binary_name() is "ipfs.exe" on a Windows host, "ipfs" elsewhere —
+    # the fallback looks for the host's name, so the test must too.
+    manual = tmp_path / "bin" / "plan9-weirdarch" / basic_ipfs._binary_name()
     manual.parent.mkdir(parents=True)
     manual.write_text("#!/bin/sh\necho manual\n")
 
@@ -407,7 +409,7 @@ def test_find_or_install_musl_manual_binary(tmp_path, monkeypatch):
     monkeypatch.setattr(basic_ipfs.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(basic_ipfs, "_is_musl", lambda: True)
     monkeypatch.setattr(basic_ipfs, "user_data_dir", lambda app: str(tmp_path))
-    manual = tmp_path / "bin" / "linux-x86_64" / "ipfs"
+    manual = tmp_path / "bin" / "linux-x86_64" / basic_ipfs._binary_name()
     manual.parent.mkdir(parents=True)
     manual.write_text("#!/bin/sh\necho musl\n")
 
