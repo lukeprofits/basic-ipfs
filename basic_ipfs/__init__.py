@@ -964,16 +964,31 @@ class IPFSManager:
     ``swarm_connect``, ``my_addrs``, ``status``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, host: str | None = None, port: int | None = None) -> None:
+        # ``host`` / ``port`` pin this manager to one daemon endpoint. Left as
+        # None they follow the module-level API_HOST / API_PORT, re-read on
+        # every start(), which is the behaviour every existing caller relies
+        # on. Set, they are this instance's alone -- two managers in one
+        # process can talk to two daemons without mutating globals.
+        self._host_override = host
+        self._port_override = port
         self._binary: Path | None = None
         self._repo: Path | None = None
         self._process: subprocess.Popen[bytes] | None = None
         self._owns_daemon = False
-        self._api_url = f"http://{API_HOST}:{API_PORT}/api/v0"
+        self._api_url = f"http://{self._host}:{self._port}/api/v0"
         self._session: requests.Session | None = None
         self._log_path: Path | None = None
         self._log_file: io.IOBase | None = None  # writable handle for subprocess stderr
         self._initialised = False
+
+    @property
+    def _host(self) -> str:
+        return self._host_override if self._host_override is not None else API_HOST
+
+    @property
+    def _port(self) -> int:
+        return self._port_override if self._port_override is not None else API_PORT
 
     # ---------------- startup ----------------
 
@@ -985,8 +1000,8 @@ class IPFSManager:
             self._repo = _get_repo_path()
             self._session = _build_api_session()
             # Re-read config every start so callers can change API_HOST/API_PORT
-            # between stop() and start().
-            self._api_url = f"http://{API_HOST}:{API_PORT}/api/v0"
+            # between stop() and start() (unless this instance pinned its own).
+            self._api_url = f"http://{self._host}:{self._port}/api/v0"
 
             self._ensure_repo()
 
@@ -1101,7 +1116,7 @@ class IPFSManager:
         try:
             self._run_cli(
                 "config", "Addresses.API",
-                f"/ip4/{API_HOST}/tcp/{API_PORT}",
+                f"/ip4/{self._host}/tcp/{self._port}",
             )
         except subprocess.CalledProcessError as exc:
             logger.warning("Could not set API address: %s", exc.stderr)
@@ -1171,9 +1186,9 @@ class IPFSManager:
             return
 
         # If something is bound to the port and isn't a Kubo daemon, fail loud.
-        if _is_port_in_use(API_HOST, API_PORT):
+        if _is_port_in_use(self._host, self._port):
             raise IPFSPortInUse(
-                f"Port {API_HOST}:{API_PORT} is in use but does not look like an IPFS daemon. "
+                f"Port {self._host}:{self._port} is in use but does not look like an IPFS daemon. "
                 f"Set basic_ipfs.API_PORT to a different port, or stop whatever is using it."
             )
 
@@ -1291,6 +1306,16 @@ class IPFSManager:
 
     # ---------------- HTTP helpers ----------------
 
+    def is_daemon_up(self) -> bool:
+        """Is a Kubo daemon answering at this manager's endpoint?
+
+        Never starts one, and works before :meth:`start` -- a caller deciding
+        whether to start a node, or a test deciding whether to skip, asks this.
+        """
+        if self._session is None:
+            self._session = _build_api_session()
+        return self._is_api_up()
+
     def _is_api_up(self) -> bool:
         # Confirm the listener on API_HOST:API_PORT is actually a Kubo
         # daemon, not a stray service that happens to return 200 on POST.
@@ -1384,6 +1409,9 @@ class IPFSManager:
         provide: bool = True,
         only_hash: bool = False,
         timeout: float | None = None,
+        chunker: str | None = None,
+        cid_version: int = 1,
+        raw_leaves: bool | None = None,
     ) -> str:
         # Build a single multipart part that streams from disk (or from
         # bytes wrapped in BytesIO). _iter_multipart() ensures the upload
@@ -1411,10 +1439,19 @@ class IPFSManager:
                 f"source must be str, PathLike, or bytes, not {type(source).__name__}"
             )
 
+        if cid_version not in (0, 1):
+            raise ValueError(f"cid_version must be 0 or 1, not {cid_version!r}")
         params: list[tuple[str, str]] = [
             ("pin", "true" if pin else "false"),
-            ("cid-version", "1"),
+            ("cid-version", str(cid_version)),
         ]
+        # Stated rather than inherited when the caller cares: the chunker and
+        # raw-leaves choice change the CID, so a caller that stores CIDs must
+        # be able to pin them down. None keeps Kubo's own default.
+        if chunker is not None:
+            params.append(("chunker", chunker))
+        if raw_leaves is not None:
+            params.append(("raw-leaves", "true" if raw_leaves else "false"))
         if not provide:
             # Skip DHT announce. Content is still locally addressable; peers
             # who already know the CID can fetch via bitswap, but no provider
@@ -1455,8 +1492,19 @@ class IPFSManager:
         provide: bool = True,
         *,
         timeout: float | None = None,
+        chunker: str | None = None,
+        cid_version: int = 1,
+        raw_leaves: bool | None = None,
     ) -> str:
-        return self._add(source, pin=True, provide=provide, timeout=timeout)
+        return self._add(
+            source,
+            pin=True,
+            provide=provide,
+            timeout=timeout,
+            chunker=chunker,
+            cid_version=cid_version,
+            raw_leaves=raw_leaves,
+        )
 
     def announce(
         self,
@@ -1547,12 +1595,24 @@ class IPFSManager:
         *,
         timeout: float | None = None,
         max_bytes: int | None = -1,
+        offset: int | None = None,
+        length: int | None = None,
     ) -> bytes | None:
+        # ``offset`` / ``length`` read a byte range, passed straight to Kubo's
+        # /api/v0/cat (int64 both). Note for callers sampling many offsets: a
+        # range read of a chunked DAG transfers whole blocks, not just the
+        # range, so 4 KiB from a 1 MiB-chunked object can pull several MB.
+        params: dict[str, Any] = {"arg": cid}
+        for name, value in (("offset", offset), ("length", length)):
+            if value is not None:
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise ValueError(f"{name} must be a non-negative int, not {value!r}")
+                params[name] = value
         # Streaming path: writing to disk is unbounded — the caller chose to
         # spend disk, not RAM. The in-memory path is bounded by
         # ``max_bytes`` (or the module-level ``MAX_GET_BYTES`` default), so a
         # malicious / oversized CID can't OOM a long-running service.
-        resp = self._post("cat", params={"arg": cid}, stream=True, timeout=timeout)
+        resp = self._post("cat", params=params, stream=True, timeout=timeout)
         if output_path is not None:
             out_path = Path(os.fspath(output_path))
             try:
@@ -1793,6 +1853,9 @@ def add(
     provide: bool = True,
     *,
     timeout: float | None = None,
+    chunker: str | None = None,
+    cid_version: int = 1,
+    raw_leaves: bool | None = None,
 ) -> str:
     """Add a file (path or bytes) to IPFS and pin it. Returns the CID.
 
@@ -1803,8 +1866,20 @@ def add(
 
     ``timeout`` (seconds) bounds the upload. Default ``None`` waits as
     long as the daemon needs (right for huge files).
+
+    ``chunker`` (e.g. ``"size-1048576"``), ``cid_version`` and
+    ``raw_leaves`` all change the resulting CID. Leave them unset to keep
+    Kubo's defaults (CIDv1, as before); set them when you store CIDs and
+    need them reproducible regardless of a future default.
     """
-    return _get_manager().add(source, provide=provide, timeout=timeout)
+    return _get_manager().add(
+        source,
+        provide=provide,
+        timeout=timeout,
+        chunker=chunker,
+        cid_version=cid_version,
+        raw_leaves=raw_leaves,
+    )
 
 
 def announce(
@@ -1826,9 +1901,24 @@ _GET_TIMEOUT_DEFAULT = object()
 
 
 @overload
-def get(cid: str) -> bytes: ...
+def get(
+    cid: str,
+    *,
+    timeout: Any = ...,
+    max_bytes: int | None = ...,
+    offset: int | None = ...,
+    length: int | None = ...,
+) -> bytes: ...
 @overload
-def get(cid: str, output_path: str | os.PathLike[str]) -> None: ...
+def get(
+    cid: str,
+    output_path: str | os.PathLike[str],
+    *,
+    timeout: Any = ...,
+    max_bytes: int | None = ...,
+    offset: int | None = ...,
+    length: int | None = ...,
+) -> None: ...
 
 
 def get(
@@ -1837,8 +1927,10 @@ def get(
     *,
     timeout: Any = _GET_TIMEOUT_DEFAULT,
     max_bytes: int | None = -1,
+    offset: int | None = None,
+    length: int | None = None,
 ) -> bytes | None:
-    """Retrieve content by CID.
+    """Retrieve content by CID, or a byte range of it.
 
     Returns bytes unless ``output_path`` is given (then writes to disk and
     returns ``None``).
@@ -1854,12 +1946,24 @@ def get(
     box). Pass ``None`` to opt out of the cap entirely (e.g. a CLI tool
     that's fine letting the OS OOM-kill it). Ignored when ``output_path``
     is set — streaming to disk is unbounded by design.
+
+    ``offset`` / ``length`` return only that byte range (``length`` past the
+    end is truncated by the daemon). The daemon still fetches whole blocks
+    to serve it, so a small range of a large chunked object can cost several
+    blocks of transfer.
     """
     effective_timeout = (
         DEFAULT_GET_TIMEOUT if timeout is _GET_TIMEOUT_DEFAULT else timeout
     )
+    # Forwarded only when given, so a manager written against the
+    # range-less cat() signature keeps working for range-less reads.
+    ranged: dict[str, int] = {}
+    if offset is not None:
+        ranged["offset"] = offset
+    if length is not None:
+        ranged["length"] = length
     return _get_manager().cat(
-        cid, output_path, timeout=effective_timeout, max_bytes=max_bytes
+        cid, output_path, timeout=effective_timeout, max_bytes=max_bytes, **ranged
     )
 
 
