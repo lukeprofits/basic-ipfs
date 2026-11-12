@@ -138,6 +138,59 @@ basic_ipfs.STORAGE_MAX = "100GB"           # repo size cap ("" = unlimited)
 
 Default repo location is `~/.local/share/basic_ipfs/ipfs_repo` (`platformdirs` picks the right path per OS).
 
+### A node of your own
+
+The module-level functions share one daemon. A program that wants its own --
+or several on one machine -- makes a manager and gives it its own repo and
+ports:
+
+```python
+import basic_ipfs
+
+node = basic_ipfs.IPFSManager(
+    port=5611,             # API
+    repo="/var/lib/myapp/ipfs",
+    gateway_port=8611,
+    swarm_port=4611,       # the port other nodes reach it on
+)
+node.start()
+cid = node.add(b"hello")
+print(node.peer_id())
+node.stop()                # yours to stop: only the shared daemon stops itself at exit
+```
+
+Anything left out follows the module settings above.
+
+### Streams: one program talking to another
+
+Two programs on two machines can talk through their IPFS daemons: an
+encrypted pipe that reaches nodes behind home routers the way IPFS does.
+Start the daemon with `streams=True`; one side listens, the other forwards.
+
+```python
+# Machine A -- your program listens on local port 9001
+a = basic_ipfs.IPFSManager(streams=True)
+a.start()
+a.stream_listen("chat", 9001)        # "chat" streams from peers arrive on 127.0.0.1:9001
+print(a.peer_id())                   # give this to B
+```
+
+```python
+# Machine B -- connect to 127.0.0.1:9002 and you are talking to the program on A
+b = basic_ipfs.IPFSManager(streams=True)
+b.start()
+b.stream_forward("chat", 9002, "<peer ID of A>")
+```
+
+`stream_close("chat")` closes the listeners and forwards of that name;
+`stream_close()` closes them all.
+
+Two things to know. The listening side is **not told which peer connected**:
+if your program cares who it is talking to, it must check that itself, with
+signatures. The forwarding side does know, because it reaches the peer it
+named or nobody. And this is a Kubo feature still marked experimental
+(`Libp2pStreamMounting`), which is why it is off unless you ask.
+
 ### Two-node example
 
 Anything you `add()` on one machine can be `get()`-ed on another that knows

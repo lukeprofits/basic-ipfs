@@ -744,6 +744,19 @@ def _get_repo_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _stream_protocol(name: str) -> str:
+    """The libp2p protocol for a stream name: ``chat`` -> ``/x/chat``.
+
+    Kubo requires the ``/x/`` prefix. Names are kept to a plain token so one
+    cannot be mistaken for a path or smuggle a second argument.
+    """
+    if not name or not all(c.isalnum() or c in "-_." for c in name):
+        raise IPFSOperationError(
+            f"a stream name is letters, digits, '-', '_' and '.': {name!r}"
+        )
+    return f"/x/{name}"
+
+
 def _as_str_list(arg: str | Iterable[str]) -> list[str]:
     """Normalise a single string or an iterable of strings into a plain list."""
     if isinstance(arg, str):
@@ -962,9 +975,22 @@ class IPFSManager:
     ``add``, ``announce``, ``add_folder``, ``cat``, ``pin_add``, ``pin_rm``,
     ``pin_ls``, ``pin_check``, ``block_exists``, ``repo_gc``, ``swarm_peers``,
     ``swarm_connect``, ``my_addrs``, ``status``.
+
+    Also, for a program that runs its own manager: ``peer_id`` and the
+    peer-to-peer streams ``stream_listen``, ``stream_forward``,
+    ``stream_close``.
     """
 
-    def __init__(self, host: str | None = None, port: int | None = None) -> None:
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        *,
+        repo: str | os.PathLike[str] | None = None,
+        gateway_port: int | None = None,
+        swarm_port: int | None = None,
+        streams: bool = False,
+    ) -> None:
         # ``host`` / ``port`` pin this manager to one daemon endpoint. Left as
         # None they follow the module-level API_HOST / API_PORT, re-read on
         # every start(), which is the behaviour every existing caller relies
@@ -972,6 +998,17 @@ class IPFSManager:
         # process can talk to two daemons without mutating globals.
         self._host_override = host
         self._port_override = port
+        # ``repo``, ``gateway_port`` and ``swarm_port`` give this manager a
+        # daemon of its own: its own repository on disk and its own ports, so
+        # several can run on one machine. Left as None they follow REPO_PATH,
+        # GATEWAY_PORT and SWARM_ADDRESSES like every manager before them.
+        self._repo_override = Path(repo) if repo is not None else None
+        self._gateway_port_override = gateway_port
+        self._swarm_port_override = swarm_port
+        # ``streams`` turns on Kubo's peer-to-peer streams (stream_listen /
+        # stream_forward) when this manager starts the daemon. Off by default:
+        # it is a Kubo feature still marked experimental.
+        self._streams = streams
         self._binary: Path | None = None
         self._repo: Path | None = None
         self._process: subprocess.Popen[bytes] | None = None
@@ -997,7 +1034,7 @@ class IPFSManager:
             return
         try:
             self._binary = _find_or_install_kubo()
-            self._repo = _get_repo_path()
+            self._repo = self._repo_override or _get_repo_path()
             self._session = _build_api_session()
             # Re-read config every start so callers can change API_HOST/API_PORT
             # between stop() and start() (unless this instance pinned its own).
@@ -1013,6 +1050,7 @@ class IPFSManager:
                 self._configure_gateway_address()
                 self._configure_storage_limit()
                 self._configure_swarm_addresses()
+                self._configure_streams()
 
             _swarm_key_warn_if_world_readable()
             self._start_daemon()
@@ -1125,10 +1163,16 @@ class IPFSManager:
         try:
             self._run_cli(
                 "config", "Addresses.Gateway",
-                f"/ip4/{GATEWAY_HOST}/tcp/{GATEWAY_PORT}",
+                f"/ip4/{GATEWAY_HOST}/tcp/{self._gateway_port}",
             )
         except subprocess.CalledProcessError as exc:
             logger.warning("Could not set Gateway address: %s", exc.stderr)
+
+    @property
+    def _gateway_port(self) -> int:
+        if self._gateway_port_override is not None:
+            return self._gateway_port_override
+        return GATEWAY_PORT
 
     def _configure_storage_limit(self) -> None:
         if not STORAGE_MAX:
@@ -1139,15 +1183,35 @@ class IPFSManager:
             logger.warning("Could not set storage limit: %s", exc.stderr)
 
     def _configure_swarm_addresses(self) -> None:
-        if SWARM_ADDRESSES is None:
+        if self._swarm_port_override is not None:
+            port = self._swarm_port_override
+            addresses = [
+                f"/ip4/0.0.0.0/tcp/{port}",
+                f"/ip6/::/tcp/{port}",
+                f"/ip4/0.0.0.0/udp/{port}/quic-v1",
+                f"/ip6/::/udp/{port}/quic-v1",
+            ]
+        elif SWARM_ADDRESSES is not None:
+            addresses = list(SWARM_ADDRESSES)
+        else:
             return
         try:
             self._run_cli(
                 "config", "Addresses.Swarm",
-                "--json", json.dumps(list(SWARM_ADDRESSES)),
+                "--json", json.dumps(addresses),
             )
         except subprocess.CalledProcessError as exc:
             logger.warning("Could not set Addresses.Swarm: %s", exc.stderr)
+
+    def _configure_streams(self) -> None:
+        if not self._streams:
+            return
+        try:
+            self._run_cli(
+                "config", "--json", "Experimental.Libp2pStreamMounting", "true",
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning("Could not enable peer-to-peer streams: %s", exc.stderr)
 
     def _open_daemon_log(self) -> None:
         """Open the daemon log file, rotating if the previous one is large."""
@@ -1782,6 +1846,59 @@ class IPFSManager:
     def my_addrs(self) -> list[str]:
         resp = self._post("id", timeout=5).json()
         return resp.get("Addresses", []) or []
+
+    def peer_id(self) -> str:
+        """This node's peer ID: the name other nodes dial it by."""
+        return str(self._post("id", timeout=5).json()["ID"])
+
+    # ---------------- peer-to-peer streams ----------------
+    #
+    # A stream is a private, encrypted pipe between two IPFS nodes, carried by
+    # the daemons and reaching nodes behind home routers the way IPFS itself
+    # does. One side listens, the other forwards:
+    #
+    #   A: stream_listen("chat", 9001)        # peers' "chat" streams -> my port 9001
+    #   B: stream_forward("chat", 9002, A_id) # my port 9002 -> A's "chat" listener
+    #
+    # after which B's program connects to 127.0.0.1:9002 and is talking to A's
+    # program on 127.0.0.1:9001. The daemon must have been started with
+    # ``streams=True``.
+    #
+    # The listening side is NOT told which peer connected: a program that
+    # cares who it is talking to must check that itself (signatures). The
+    # forwarding side does know -- it reaches the peer it named, or nobody.
+
+    def stream_listen(self, name: str, port: int) -> None:
+        """Send peers' streams called `name` to this machine's local `port`."""
+        self._stream("p2p/listen", name, f"/ip4/127.0.0.1/tcp/{port}")
+
+    def stream_forward(self, name: str, port: int, peer_id: str) -> None:
+        """Make local `port` a pipe to `peer_id`'s listener called `name`."""
+        if not peer_id or "/" in peer_id:
+            raise IPFSOperationError(f"not a peer ID: {peer_id!r}")
+        self._stream(
+            "p2p/forward", name, f"/ip4/127.0.0.1/tcp/{port}", f"/p2p/{peer_id}"
+        )
+
+    def stream_close(self, name: str | None = None) -> None:
+        """Close every listener and forward called `name`, or all of them."""
+        if name is None:
+            params: list[tuple[str, Any]] = [("all", "true")]
+        else:
+            params = [("protocol", _stream_protocol(name))]
+        self._post("p2p/close", params=params, timeout=10)
+
+    def _stream(self, endpoint: str, name: str, *addrs: str) -> None:
+        params = [("arg", _stream_protocol(name)), *(("arg", a) for a in addrs)]
+        try:
+            self._post(endpoint, params=params, timeout=30)
+        except IPFSOperationError as exc:
+            if "libp2p stream mounting not enabled" in str(exc).lower():
+                raise IPFSOperationError(
+                    "peer-to-peer streams are off for this daemon: start it "
+                    "with IPFSManager(streams=True)"
+                ) from exc
+            raise
 
     def status(self) -> StatusDict:
         ver = self._post("version", timeout=5).json()
