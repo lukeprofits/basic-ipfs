@@ -45,6 +45,11 @@ def test_listen_forward_and_close_send_what_kubo_expects() -> None:
     m.stream_forward("chat", 9002, "12D3KooWPeer")
     m.stream_close("chat")
     m.stream_close()
+    m.stream_close("chat", port=9002)
+    assert calls[4]["params"] == [
+        ("protocol", "/x/chat"),
+        ("listen-address", "/ip4/127.0.0.1/tcp/9002"),
+    ]
     assert calls[0]["endpoint"] == "p2p/listen"
     assert calls[0]["params"] == [("arg", "/x/chat"), ("arg", "/ip4/127.0.0.1/tcp/9001")]
     assert calls[1]["endpoint"] == "p2p/forward"
@@ -154,6 +159,13 @@ def test_two_programs_talk_through_two_daemons(tmp_path: Path) -> None:
             conn.sendall(b"hello")
             assert conn.recv(100) == b"echo:hello"
         server.close()
+        # closing one forward leaves the port refusing, and the listener alone
+        b.stream_close("basic-ipfs-test", port=9622)
+        with pytest.raises(OSError):
+            socket.create_connection(("127.0.0.1", 9622), timeout=5)
+        b.stream_forward("basic-ipfs-test", 9623, a.peer_id())
+        with socket.create_connection(("127.0.0.1", 9623), timeout=30):
+            pass
         # and content added on one is fetched by the other
         cid = a.add(b"x" * 100_000, provide=False)
         assert b.cat(cid, timeout=30) == b"x" * 100_000

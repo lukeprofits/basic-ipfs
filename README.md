@@ -182,7 +182,8 @@ b.start()
 b.stream_forward("chat", 9002, "<peer ID of A>")
 ```
 
-`stream_close("chat")` closes the listeners and forwards of that name;
+`stream_close("chat")` closes the listeners and forwards of that name,
+`stream_close("chat", port=9002)` only the forward on that local port, and
 `stream_close()` closes them all.
 
 Two things to know. The listening side is **not told which peer connected**:

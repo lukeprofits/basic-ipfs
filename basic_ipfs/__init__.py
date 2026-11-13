@@ -1880,12 +1880,18 @@ class IPFSManager:
             "p2p/forward", name, f"/ip4/127.0.0.1/tcp/{port}", f"/p2p/{peer_id}"
         )
 
-    def stream_close(self, name: str | None = None) -> None:
-        """Close every listener and forward called `name`, or all of them."""
-        if name is None:
-            params: list[tuple[str, Any]] = [("all", "true")]
-        else:
-            params = [("protocol", _stream_protocol(name))]
+    def stream_close(self, name: str | None = None, *, port: int | None = None) -> None:
+        """Close every listener and forward called `name`, or all of them.
+
+        With `port`, close only the forward that was given that local port.
+        """
+        params: list[tuple[str, Any]] = []
+        if name is not None:
+            params.append(("protocol", _stream_protocol(name)))
+        if port is not None:
+            params.append(("listen-address", f"/ip4/127.0.0.1/tcp/{port}"))
+        if not params:
+            params.append(("all", "true"))
         self._post("p2p/close", params=params, timeout=10)
 
     def _stream(self, endpoint: str, name: str, *addrs: str) -> None:
