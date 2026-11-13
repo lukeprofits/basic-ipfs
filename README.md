@@ -192,6 +192,30 @@ signatures. The forwarding side does know, because it reaches the peer it
 named or nobody. And this is a Kubo feature still marked experimental
 (`Libp2pStreamMounting`), which is why it is off unless you ask.
 
+### Topics: many programs hearing each other
+
+A topic is a name. Any node may publish to it, and every node listening on it
+hears what is published. Start the daemon with `topics=True`.
+
+```python
+node = basic_ipfs.IPFSManager(topics=True)
+node.start()
+
+def heard(data, sender):          # bytes, and the peer ID that published them
+    print(sender, data)
+
+stop = node.topic_listen("weather", heard)
+node.topic_publish("weather", b"rain")
+stop()
+```
+
+Three things to know. A message reaches the listeners your node is connected
+to, directly or through other listeners, so two nodes that have never met
+need to connect first (`swarm_connect`). Nothing is stored: a node that
+starts listening later has missed it. And this is Kubo's experimental pubsub
+(`Pubsub.Enabled`), which Kubo's maintainers describe as tuned for IPNS and
+may change, which is why it is off unless you ask.
+
 ### Two-node example
 
 Anything you `add()` on one machine can be `get()`-ed on another that knows

@@ -21,10 +21,12 @@ The daemon starts lazily on the first call and stops cleanly on process exit.
 from __future__ import annotations
 
 import atexit
+import base64
 import datetime
 import glob as _glob
 import hashlib
 import hmac
+import http.client
 import io
 import ipaddress
 import json
@@ -757,6 +759,30 @@ def _stream_protocol(name: str) -> str:
     return f"/x/{name}"
 
 
+def _topic_arg(topic: str) -> str:
+    """A topic name as Kubo's RPC wants it: multibase base64url."""
+    if not topic or not isinstance(topic, str):
+        raise IPFSOperationError(f"not a topic name: {topic!r}")
+    encoded = base64.urlsafe_b64encode(topic.encode("utf-8")).decode().rstrip("=")
+    return "u" + encoded
+
+
+def _from_multibase(text: str) -> bytes:
+    if not isinstance(text, str) or not text.startswith("u"):
+        raise ValueError("not multibase base64url")
+    body = text[1:]
+    return base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+
+
+def _topics_off(exc: IPFSOperationError) -> IPFSOperationError:
+    text = str(exc).lower()
+    if "pubsub" in text and ("not enabled" in text or "experimental" in text):
+        return IPFSOperationError(
+            "topics are off for this daemon: start it with IPFSManager(topics=True)"
+        )
+    return exc
+
+
 def _as_str_list(arg: str | Iterable[str]) -> list[str]:
     """Normalise a single string or an iterable of strings into a plain list."""
     if isinstance(arg, str):
@@ -990,6 +1016,7 @@ class IPFSManager:
         gateway_port: int | None = None,
         swarm_port: int | None = None,
         streams: bool = False,
+        topics: bool = False,
     ) -> None:
         # ``host`` / ``port`` pin this manager to one daemon endpoint. Left as
         # None they follow the module-level API_HOST / API_PORT, re-read on
@@ -1009,6 +1036,10 @@ class IPFSManager:
         # stream_forward) when this manager starts the daemon. Off by default:
         # it is a Kubo feature still marked experimental.
         self._streams = streams
+        # ``topics`` turns on Kubo's publish/subscribe (topic_publish /
+        # topic_listen) the same way, and is off by default for the same
+        # reason.
+        self._topics = topics
         self._binary: Path | None = None
         self._repo: Path | None = None
         self._process: subprocess.Popen[bytes] | None = None
@@ -1051,6 +1082,7 @@ class IPFSManager:
                 self._configure_storage_limit()
                 self._configure_swarm_addresses()
                 self._configure_streams()
+                self._configure_topics()
 
             _swarm_key_warn_if_world_readable()
             self._start_daemon()
@@ -1212,6 +1244,14 @@ class IPFSManager:
             )
         except subprocess.CalledProcessError as exc:
             logger.warning("Could not enable peer-to-peer streams: %s", exc.stderr)
+
+    def _configure_topics(self) -> None:
+        if not self._topics:
+            return
+        try:
+            self._run_cli("config", "--json", "Pubsub.Enabled", "true")
+        except subprocess.CalledProcessError as exc:
+            logger.warning("Could not enable topics: %s", exc.stderr)
 
     def _open_daemon_log(self) -> None:
         """Open the daemon log file, rotating if the previous one is large."""
@@ -1893,6 +1933,90 @@ class IPFSManager:
         if not params:
             params.append(("all", "true"))
         self._post("p2p/close", params=params, timeout=10)
+
+    # ---------------- topics: publish and listen ----------------
+    #
+    # A topic is a name many nodes can publish to and listen on at once
+    # (libp2p pubsub). What one publishes reaches the nodes listening to that
+    # topic that it is connected to, directly or through others listening.
+    # Nothing is stored: a node that starts listening later has missed it.
+    # The daemon must have been started with ``topics=True``.
+
+    def topic_publish(self, topic: str, data: bytes) -> None:
+        """Send `data` to every node listening on `topic`."""
+        try:
+            self._post(
+                "pubsub/pub",
+                params={"arg": _topic_arg(topic)},
+                files={"file": ("data", bytes(data))},
+                timeout=30,
+            )
+        except IPFSOperationError as exc:
+            raise _topics_off(exc) from exc
+
+    def topic_listen(self, topic: str, on_message: Any) -> Any:
+        """Call `on_message(data, sender)` for each message on `topic`.
+
+        `data` is the bytes published; `sender` is the peer ID of the node
+        that published them. Returns a function; call it to stop. Runs on a
+        thread of its own, and listens again if the daemon restarts.
+        """
+        arg = _topic_arg(topic)
+        # Ask something quick first, so that a daemon without topics fails
+        # loudly here rather than quietly on a background thread. (The
+        # subscription itself answers nothing until a message arrives.)
+        try:
+            self._post("pubsub/ls", timeout=10)
+        except IPFSOperationError as exc:
+            raise _topics_off(exc) from exc
+        stopped = threading.Event()
+        # The subscription is one long reply that only ends when its socket
+        # does, so it has a connection of its own that stop() can shut.
+        host, port = self._host, self._port
+        current: list[Any] = [None]
+
+        def work() -> None:
+            wait = 1.0
+            while not stopped.is_set():
+                conn = http.client.HTTPConnection(host, port)
+                current[0] = conn
+                try:
+                    conn.request("POST", f"/api/v0/pubsub/sub?arg={arg}")
+                    resp = conn.getresponse()
+                    if resp.status == 200:
+                        wait = 1.0
+                        while line := resp.readline():
+                            if stopped.is_set():
+                                return
+                            try:
+                                message = json.loads(line)
+                                data = _from_multibase(message["data"])
+                                sender = str(message.get("from", ""))
+                            except (ValueError, KeyError, TypeError):
+                                continue
+                            try:
+                                on_message(data, sender)
+                            except Exception:
+                                logger.exception("on_message raised")
+                except (OSError, http.client.HTTPException):
+                    pass  # daemon gone or connection cut: try again below
+                finally:
+                    conn.close()
+                stopped.wait(wait)
+                wait = min(wait * 2, 30.0)
+
+        threading.Thread(target=work, daemon=True, name="basic_ipfs_topic").start()
+
+        def stop() -> None:
+            stopped.set()
+            sock = getattr(current[0], "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        return stop
 
     def _stream(self, endpoint: str, name: str, *addrs: str) -> None:
         params = [("arg", _stream_protocol(name)), *(("arg", a) for a in addrs)]
