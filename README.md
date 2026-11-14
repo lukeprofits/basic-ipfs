@@ -216,6 +216,28 @@ starts listening later has missed it. And this is Kubo's experimental pubsub
 (`Pubsub.Enabled`), which Kubo's maintainers describe as tuned for IPNS and
 may change, which is why it is off unless you ask.
 
+### Adding a file in place
+
+An ordinary `add` copies the file into the node's repository. For a large
+file that is already where you want it -- on another drive, say -- the node
+can leave it there and serve it from where it is. Start the daemon with
+`in_place=True`.
+
+```python
+node = basic_ipfs.IPFSManager(repo="/home/me/node/ipfs", in_place=True)
+node.start()
+cid = node.add("/home/me/node/films/big.mkv", in_place=True)
+```
+
+Four things to know. The file must be in the folder that holds the
+repository (`/home/me/node` above) or below it; a link there to a folder on
+another drive counts, so `ln -s /mnt/big /home/me/node/big` and then
+`node.add("/home/me/node/big/film.mkv", in_place=True)` works. The file must
+stay as it is: moved, changed or on an unplugged drive, reads of it fail
+until it is back, and the node carries on. Unpinning never deletes the file;
+that is yours to do. And this is Kubo's experimental filestore
+(`Experimental.FilestoreEnabled`), which is why it is off unless you ask.
+
 ### Two-node example
 
 Anything you `add()` on one machine can be `get()`-ed on another that knows

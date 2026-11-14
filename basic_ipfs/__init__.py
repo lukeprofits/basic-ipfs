@@ -46,7 +46,7 @@ import zipfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, TypedDict, overload
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 from platformdirs import user_data_dir
@@ -774,6 +774,14 @@ def _from_multibase(text: str) -> bytes:
     return base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
 
 
+def _in_place_refused(exc: IPFSOperationError) -> IPFSOperationError:
+    return IPFSOperationError(
+        "that file cannot be added in place: start the daemon with "
+        "IPFSManager(in_place=True), and keep the file (or a link to its "
+        f"folder) in the folder that holds the repository ({exc})"
+    )
+
+
 def _topics_off(exc: IPFSOperationError) -> IPFSOperationError:
     text = str(exc).lower()
     if "pubsub" in text and ("not enabled" in text or "experimental" in text):
@@ -842,6 +850,7 @@ def _quote_multipart_filename(name: str) -> str:
 
 def _iter_multipart(
     parts: list[tuple[str, str, bytes | os.PathLike[str] | io.IOBase]],
+    where: str | None = None,
 ) -> tuple[str, Iterable[bytes]]:
     """Build a streaming multipart/form-data body.
 
@@ -857,6 +866,11 @@ def _iter_multipart(
     # ample uniqueness; the leading dashes match what RFC 7578 examples use.
     boundary = "----basic_ipfs_" + os.urandom(16).hex()
     boundary_bytes = boundary.encode("ascii")
+    # ``where`` tells Kubo the file's own path, for an add that leaves the
+    # file in place. Percent-encoded, so no byte of it can end the header.
+    located = (
+        "" if where is None else f"abspath-encoded: {quote(where, safe='/')}\r\n"
+    )
 
     def gen() -> Iterable[bytes]:
         for filename, content_type, body in parts:
@@ -864,7 +878,7 @@ def _iter_multipart(
             yield b"--" + boundary_bytes + b"\r\n"
             yield (
                 f'Content-Disposition: form-data; name="file"; filename="{quoted}"\r\n'
-                f"Content-Type: {content_type}\r\n\r\n"
+                f"{located}Content-Type: {content_type}\r\n\r\n"
             ).encode()
             if isinstance(body, (bytes, bytearray, memoryview)):
                 yield bytes(body)
@@ -1017,6 +1031,7 @@ class IPFSManager:
         swarm_port: int | None = None,
         streams: bool = False,
         topics: bool = False,
+        in_place: bool = False,
     ) -> None:
         # ``host`` / ``port`` pin this manager to one daemon endpoint. Left as
         # None they follow the module-level API_HOST / API_PORT, re-read on
@@ -1040,6 +1055,10 @@ class IPFSManager:
         # topic_listen) the same way, and is off by default for the same
         # reason.
         self._topics = topics
+        # ``in_place`` lets ``add(path, in_place=True)`` leave a file where it
+        # is and serve it from there (Kubo's filestore). Off by default for
+        # the same reason.
+        self._in_place = in_place
         self._binary: Path | None = None
         self._repo: Path | None = None
         self._process: subprocess.Popen[bytes] | None = None
@@ -1083,6 +1102,7 @@ class IPFSManager:
                 self._configure_swarm_addresses()
                 self._configure_streams()
                 self._configure_topics()
+                self._configure_in_place()
 
             _swarm_key_warn_if_world_readable()
             self._start_daemon()
@@ -1252,6 +1272,16 @@ class IPFSManager:
             self._run_cli("config", "--json", "Pubsub.Enabled", "true")
         except subprocess.CalledProcessError as exc:
             logger.warning("Could not enable topics: %s", exc.stderr)
+
+    def _configure_in_place(self) -> None:
+        if not self._in_place:
+            return
+        try:
+            self._run_cli(
+                "config", "--json", "Experimental.FilestoreEnabled", "true",
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning("Could not enable adding in place: %s", exc.stderr)
 
     def _open_daemon_log(self) -> None:
         """Open the daemon log file, rotating if the previous one is large."""
@@ -1516,7 +1546,18 @@ class IPFSManager:
         chunker: str | None = None,
         cid_version: int = 1,
         raw_leaves: bool | None = None,
+        in_place: bool = False,
     ) -> str:
+        where: str | None = None
+        if in_place:
+            if not isinstance(source, (str, os.PathLike)):
+                raise TypeError("in_place needs a file path, not bytes")
+            if raw_leaves is False:
+                raise ValueError("in_place needs raw leaves")
+            raw_leaves = True
+            # Not resolved: a link beside the repository is how a file on
+            # another drive is reached, and Kubo must be given the link.
+            where = os.path.abspath(os.fspath(source))
         # Build a single multipart part that streams from disk (or from
         # bytes wrapped in BytesIO). _iter_multipart() ensures the upload
         # never holds more than 64 KB at a time in RAM, so even a multi-GB
@@ -1561,6 +1602,8 @@ class IPFSManager:
             # who already know the CID can fetch via bitswap, but no provider
             # record is published.
             params.append(("provide", "false"))
+        if where is not None:
+            params.append(("nocopy", "true"))
         if only_hash:
             # Compute the CID without writing a block to the repo, pinning,
             # or announcing anything. Pin/provide flags are silently ignored
@@ -1569,7 +1612,7 @@ class IPFSManager:
             params.append(("only-hash", "true"))
 
         boundary, body_iter = _iter_multipart(
-            [(filename, "application/octet-stream", body)]
+            [(filename, "application/octet-stream", body)], where
         )
         try:
             resp = self._post(
@@ -1579,6 +1622,10 @@ class IPFSManager:
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
                 timeout=timeout,
             )
+        except IPFSOperationError as exc:
+            if where is not None and "filestore" in str(exc):
+                raise _in_place_refused(exc) from exc
+            raise
         finally:
             if hasattr(body, "close"):
                 try:
@@ -1599,6 +1646,7 @@ class IPFSManager:
         chunker: str | None = None,
         cid_version: int = 1,
         raw_leaves: bool | None = None,
+        in_place: bool = False,
     ) -> str:
         return self._add(
             source,
@@ -1608,6 +1656,7 @@ class IPFSManager:
             chunker=chunker,
             cid_version=cid_version,
             raw_leaves=raw_leaves,
+            in_place=in_place,
         )
 
     def announce(
