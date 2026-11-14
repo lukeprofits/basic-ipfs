@@ -56,6 +56,16 @@ def test_an_ordinary_add_says_nothing_of_where_the_file_is(tmp_path: Path) -> No
     assert b"abspath" not in calls[0]["body"]
 
 
+def test_a_cid_can_be_worked_out_first_with_the_same_choices(tmp_path: Path) -> None:
+    m = basic_ipfs.IPFSManager()
+    calls = _capturing(m)
+    m.compute_cid_locally(b"hello", chunker="size-1048576", raw_leaves=True)
+    params = calls[0]["params"]
+    assert ("only-hash", "true") in params
+    assert ("chunker", "size-1048576") in params
+    assert ("raw-leaves", "true") in params
+
+
 def test_a_link_is_given_to_kubo_as_the_link(tmp_path: Path) -> None:
     (tmp_path / "drive").mkdir()
     (tmp_path / "drive" / "a.bin").write_bytes(b"hello")
@@ -128,6 +138,7 @@ def test_a_file_on_another_drive_is_served_from_where_it_is(tmp_path: Path) -> N
         # through a link beside the repository: taken, and nothing copied
         os.symlink(drive, home / "drive")
         cid = m.add(home / "drive" / "blob", in_place=True, provide=False)
+        assert cid == m.compute_cid_locally(data, raw_leaves=True)
         assert m.cat(cid) == data
         copied = sum(f.stat().st_size for f in (home / "ipfs" / "blocks").rglob("*") if f.is_file())
         assert copied < 100_000

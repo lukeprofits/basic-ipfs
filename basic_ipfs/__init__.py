@@ -1673,12 +1673,23 @@ class IPFSManager:
         source: str | bytes | os.PathLike[str],
         *,
         timeout: float | None = None,
+        chunker: str | None = None,
+        cid_version: int = 1,
+        raw_leaves: bool | None = None,
     ) -> str:
         # only-hash=true is Kubo's "chunk and hash, do not write" mode. No
         # block is stored in the repo, no pin is created, no provider record
-        # is announced, no peer ever learns the CID exists.
+        # is announced, no peer ever learns the CID exists. The chunker and
+        # leaf choice are add()'s: the same ones give the CID add() would.
         return self._add(
-            source, pin=False, provide=False, only_hash=True, timeout=timeout
+            source,
+            pin=False,
+            provide=False,
+            only_hash=True,
+            timeout=timeout,
+            chunker=chunker,
+            cid_version=cid_version,
+            raw_leaves=raw_leaves,
         )
 
     def add_folder(
