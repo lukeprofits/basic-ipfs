@@ -1761,6 +1761,7 @@ class IPFSManager:
         max_bytes: int | None = -1,
         offset: int | None = None,
         length: int | None = None,
+        local_only: bool = False,
     ) -> bytes | None:
         # ``offset`` / ``length`` read a byte range, passed straight to Kubo's
         # /api/v0/cat (int64 both). Note for callers sampling many offsets: a
@@ -1772,6 +1773,11 @@ class IPFSManager:
                 if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                     raise ValueError(f"{name} must be a non-negative int, not {value!r}")
                 params[name] = value
+        if local_only:
+            # Read what this node has and ask nobody: without it Kubo fetches
+            # whatever is missing from the swarm, and a caller asking "do I
+            # still have this?" would be told yes by somebody else's copy.
+            params["offline"] = "true"
         # Streaming path: writing to disk is unbounded — the caller chose to
         # spend disk, not RAM. The in-memory path is bounded by
         # ``max_bytes`` (or the module-level ``MAX_GET_BYTES`` default), so a
@@ -2264,7 +2270,7 @@ def get(
     )
     # Forwarded only when given, so a manager written against the
     # range-less cat() signature keeps working for range-less reads.
-    ranged: dict[str, int] = {}
+    ranged: dict[str, Any] = {}
     if offset is not None:
         ranged["offset"] = offset
     if length is not None:

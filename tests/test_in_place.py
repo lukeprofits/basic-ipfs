@@ -66,6 +66,25 @@ def test_a_cid_can_be_worked_out_first_with_the_same_choices(tmp_path: Path) -> 
     assert ("raw-leaves", "true") in params
 
 
+def test_a_read_can_be_kept_to_what_this_node_has() -> None:
+    m = basic_ipfs.IPFSManager()
+    calls: list[dict[str, Any]] = []
+
+    class Reply:
+        def iter_content(self, chunk_size: int) -> list[bytes]:
+            return [b"hi"]
+
+    def post(endpoint: str, **kw: Any) -> Reply:
+        calls.append({"endpoint": endpoint, **kw})
+        return Reply()
+
+    m._post = post  # type: ignore[method-assign,assignment]
+    assert m.cat("bafyexample", local_only=True) == b"hi"
+    assert calls[0]["params"] == {"arg": "bafyexample", "offline": "true"}
+    m.cat("bafyexample")
+    assert "offline" not in calls[1]["params"]
+
+
 def test_a_link_is_given_to_kubo_as_the_link(tmp_path: Path) -> None:
     (tmp_path / "drive").mkdir()
     (tmp_path / "drive" / "a.bin").write_bytes(b"hello")
@@ -146,8 +165,16 @@ def test_a_file_on_another_drive_is_served_from_where_it_is(tmp_path: Path) -> N
         os.rename(drive / "blob", drive / "away")
         with pytest.raises(basic_ipfs.IPFSError):
             m.cat(cid, timeout=5)
+        # asked for only what this node has, Kubo ends the reply early
+        # instead of failing it: what comes back is short, never wrong
+        try:
+            got = m.cat(cid, timeout=5, local_only=True, offset=0, length=4)
+        except basic_ipfs.IPFSError:
+            got = b""
+        assert got != data[:4]
         os.rename(drive / "away", drive / "blob")
         assert m.cat(cid) == data
+        assert m.cat(cid, local_only=True, offset=1, length=2) == data[1:3]
         # letting go of it never deletes the file: that is the caller's to do
         m.pin_rm(cid)
         m.repo_gc()
