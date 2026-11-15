@@ -243,6 +243,15 @@ then be a copy nobody reads; `node.discard(cid)` deletes the repository's
 copy first. And this is Kubo's experimental filestore
 (`Experimental.FilestoreEnabled`), which is why it is off unless you ask.
 
+### Blocks one at a time
+
+For a program that builds its own DAG nodes: `block_put(data, codec="dag-pb")`
+stores one block and returns its CID; `block_get(cid)` reads one back (from
+the network if this node lacks it, unless `local_only=True`). A block is not
+pinned by being put: `pin_add(cid, recursive=False)` keeps that block alone
+and nothing it links to, and `pin_rm(cid, recursive=False)` lets it go.
+`provide(cid)` tells the DHT this node has it.
+
 ### Two-node example
 
 Anything you `add()` on one machine can be `get()`-ed on another that knows

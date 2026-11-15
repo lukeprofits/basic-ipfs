@@ -1832,11 +1832,14 @@ class IPFSManager:
         cids: str | Iterable[str],
         *,
         timeout: float | None = None,
+        recursive: bool = True,
     ) -> None:
+        # ``recursive=False`` pins the named blocks alone, none of what they
+        # link to: for a program that keeps part of a larger object.
         cid_list = _as_str_list(cids)
         for chunk in _chunked(cid_list, _PIN_BATCH_SIZE):
             params = [("arg", c) for c in chunk]
-            params.append(("recursive", "true"))
+            params.append(("recursive", "true" if recursive else "false"))
             self._post("pin/add", params=params, timeout=timeout)
 
     def pin_rm(
@@ -1844,14 +1847,18 @@ class IPFSManager:
         cids: str | Iterable[str],
         *,
         timeout: float | None = 60,
+        recursive: bool = True,
     ) -> None:
+        # ``recursive`` must say which kind of pin it was: Kubo will not take
+        # away a block-alone pin with a recursive unpin.
+        how = "true" if recursive else "false"
         cid_list = _as_str_list(cids)
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
         for chunk in _chunked(cid_list, _PIN_BATCH_SIZE):
             try:
                 params = [("arg", c) for c in chunk]
-                params.append(("recursive", "true"))
+                params.append(("recursive", how))
                 self._post("pin/rm", params=params, timeout=timeout)
                 succeeded.extend(chunk)
             except IPFSOperationError as exc:
@@ -1882,7 +1889,7 @@ class IPFSManager:
                     try:
                         self._post(
                             "pin/rm",
-                            params={"arg": c, "recursive": "true"},
+                            params={"arg": c, "recursive": how},
                             timeout=timeout,
                         )
                         succeeded.append(c)
@@ -1915,6 +1922,64 @@ class IPFSManager:
             if exc.is_not_pinned():
                 return False
             raise
+
+    def block_put(self, data: bytes, *, codec: str = "dag-pb") -> str:
+        """Store one block as it is; return its CID (version 1, sha2-256).
+
+        For a program that builds its own DAG nodes. Not pinned: pin it, or
+        garbage collection takes it.
+        """
+        boundary, body = _iter_multipart(
+            [("block", "application/octet-stream", data)]
+        )
+        resp = self._post(
+            "block/put",
+            params={"cid-codec": codec, "mhtype": "sha2-256"},
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        return str(resp.json()["Key"])
+
+    def block_get(
+        self,
+        cid: str,
+        *,
+        timeout: float | None = 60,
+        max_bytes: int = 2 * 1024 * 1024,
+        local_only: bool = False,
+    ) -> bytes:
+        """One block's bytes: from this node, else from the network, unless
+        ``local_only``. A block is never more than ``max_bytes``."""
+        params: dict[str, Any] = {"arg": cid}
+        if local_only:
+            params["offline"] = "true"
+        resp = self._post("block/get", params=params, stream=True, timeout=timeout)
+        buf = bytearray()
+        try:
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise IPFSOperationError(
+                        f"block {cid} is over {max_bytes} bytes"
+                    )
+        except requests.RequestException as exc:
+            raise IPFSOperationError(f"block/get of {cid} failed: {exc}") from exc
+        finally:
+            resp.close()
+        return bytes(buf)
+
+    def provide(self, cid: str, *, timeout: float | None = 120) -> None:
+        """Tell the DHT this node has ``cid`` (that block alone)."""
+        resp = self._post(
+            "routing/provide", params={"arg": cid}, stream=True, timeout=timeout
+        )
+        try:
+            for _ in resp.iter_content(chunk_size=1 << 16):
+                pass
+        except requests.RequestException as exc:
+            raise IPFSOperationError(f"provide of {cid} failed: {exc}") from exc
+        finally:
+            resp.close()
 
     def block_exists(self, cid: str) -> bool:
         # offline=true is critical: without it, Kubo will try to fetch the
