@@ -229,7 +229,7 @@ node.start()
 cid = node.add("/home/me/node/films/big.mkv", in_place=True)
 ```
 
-Four things to know. The file must be in the folder that holds the
+Five things to know. The file must be in the folder that holds the
 repository (`/home/me/node` above) or below it; a link there to a folder on
 another drive counts, so `ln -s /mnt/big /home/me/node/big` and then
 `node.add("/home/me/node/big/film.mkv", in_place=True)` works. The file must
@@ -237,8 +237,10 @@ stay as it is: moved, changed or on an unplugged drive, reads of it fail
 until it is back, and the node carries on. Unpinning never deletes the file;
 that is yours to do. (`node.cat(cid, local_only=True)` reads only what this
 node has and never fetches from another node, so it tells you whether the
-file is still there: if it is not, the read fails or comes back short.) And
-this is Kubo's experimental filestore
+file is still there: if it is not, the read fails or comes back short.)
+Bytes the repository already holds are not taken from the file, which would
+then be a copy nobody reads; `node.discard(cid)` deletes the repository's
+copy first. And this is Kubo's experimental filestore
 (`Experimental.FilestoreEnabled`), which is why it is off unless you ask.
 
 ### Two-node example

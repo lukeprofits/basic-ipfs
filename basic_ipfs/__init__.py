@@ -1930,6 +1930,38 @@ class IPFSManager:
         except (IPFSOperationError, requests.exceptions.Timeout):
             return False
 
+    def discard(self, cid: str, *, timeout: float | None = 60) -> None:
+        """Delete an object's blocks from the repository now.
+
+        Garbage collection does this for everything unpinned, in its own
+        time; this does it for one object at once. Blocks that are pinned,
+        or that this node does not have, are left as they are. A file added
+        in place is not touched: only the repository's record of it goes.
+        """
+        # offline: what is being listed is what this node has, and a block
+        # it lacks must not be fetched in order to be deleted.
+        listed = self._post(
+            "refs",
+            params={
+                "arg": cid,
+                "recursive": "true",
+                "unique": "true",
+                "offline": "true",
+            },
+            timeout=timeout,
+        )
+        blocks = [cid]
+        for line in listed.text.splitlines():
+            if line.strip():
+                ref = json.loads(line).get("Ref")
+                if ref:
+                    blocks.append(ref)
+        for chunk in _chunked(blocks, _PIN_BATCH_SIZE):
+            params = [("arg", c) for c in chunk]
+            # force: a block already gone is not an error
+            params.append(("force", "true"))
+            self._post("block/rm", params=params, timeout=timeout)
+
     def repo_gc(self, *, timeout: float | None = None) -> None:
         self._post("repo/gc", timeout=timeout)
 

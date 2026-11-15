@@ -85,6 +85,30 @@ def test_a_read_can_be_kept_to_what_this_node_has() -> None:
     assert "offline" not in calls[1]["params"]
 
 
+def test_discard_lists_what_is_here_and_deletes_it() -> None:
+    m = basic_ipfs.IPFSManager()
+    calls: list[dict[str, Any]] = []
+
+    class Reply:
+        text = '{"Ref": "leaf1"}\n{"Ref": "leaf2"}\n'
+
+    def post(endpoint: str, **kw: Any) -> Reply:
+        calls.append({"endpoint": endpoint, **kw})
+        return Reply()
+
+    m._post = post  # type: ignore[method-assign,assignment]
+    m.discard("root")
+    assert calls[0]["endpoint"] == "refs"
+    assert calls[0]["params"]["offline"] == "true"
+    assert calls[1]["endpoint"] == "block/rm"
+    assert calls[1]["params"] == [
+        ("arg", "root"),
+        ("arg", "leaf1"),
+        ("arg", "leaf2"),
+        ("force", "true"),
+    ]
+
+
 def test_a_link_is_given_to_kubo_as_the_link(tmp_path: Path) -> None:
     (tmp_path / "drive").mkdir()
     (tmp_path / "drive" / "a.bin").write_bytes(b"hello")
@@ -175,6 +199,21 @@ def test_a_file_on_another_drive_is_served_from_where_it_is(tmp_path: Path) -> N
         os.rename(drive / "away", drive / "blob")
         assert m.cat(cid) == data
         assert m.cat(cid, local_only=True, offset=1, length=2) == data[1:3]
+        # Bytes the repository already has are not taken from the file: the
+        # file would be a copy nobody reads. Discard the repository's first.
+        other = os.urandom(2_500_000)
+        (drive / "other").write_bytes(other)
+        loose = m.announce(other, provide=False)
+        m.discard(loose)
+        again = m.add(home / "drive" / "other", in_place=True, provide=False, cid_version=1)
+        os.rename(drive / "other", drive / "other-away")
+        try:
+            got = m.cat(again, timeout=5, local_only=True)
+        except basic_ipfs.IPFSError:
+            got = b""
+        assert got != other
+        os.rename(drive / "other-away", drive / "other")
+        assert m.cat(again, local_only=True) == other
         # letting go of it never deletes the file: that is the caller's to do
         m.pin_rm(cid)
         m.repo_gc()
