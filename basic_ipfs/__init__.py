@@ -1032,6 +1032,7 @@ class IPFSManager:
         streams: bool = False,
         topics: bool = False,
         in_place: bool = False,
+        provide_strategy: str | None = None,
     ) -> None:
         # ``host`` / ``port`` pin this manager to one daemon endpoint. Left as
         # None they follow the module-level API_HOST / API_PORT, re-read on
@@ -1059,6 +1060,12 @@ class IPFSManager:
         # is and serve it from there (Kubo's filestore). Off by default for
         # the same reason.
         self._in_place = in_place
+        # ``provide_strategy`` is what the daemon tells the DHT it has, on its
+        # own and again every day (Kubo's ``Provide.Strategy``). Kubo's default
+        # is "all": every block added, whatever ``add(provide=False)`` asked.
+        # "mfs" announces only what is in the daemon's MFS (``mfs_add``), for
+        # a program that must not be seen to hold most of what it holds.
+        self._provide_strategy = provide_strategy
         self._binary: Path | None = None
         self._repo: Path | None = None
         self._process: subprocess.Popen[bytes] | None = None
@@ -1103,6 +1110,7 @@ class IPFSManager:
                 self._configure_streams()
                 self._configure_topics()
                 self._configure_in_place()
+                self._configure_provide_strategy()
 
             _swarm_key_warn_if_world_readable()
             self._start_daemon()
@@ -1272,6 +1280,18 @@ class IPFSManager:
             self._run_cli("config", "--json", "Pubsub.Enabled", "true")
         except subprocess.CalledProcessError as exc:
             logger.warning("Could not enable topics: %s", exc.stderr)
+
+    def _configure_provide_strategy(self) -> None:
+        if self._provide_strategy is None:
+            return
+        try:
+            self._run_cli("config", "Provide.Strategy", self._provide_strategy)
+        except subprocess.CalledProcessError as exc:
+            # Not a warning: a daemon that announces more than it was told
+            # to is a privacy failure, not a degraded feature.
+            raise IPFSError(
+                f"could not set what this node announces: {exc.stderr.strip()}"
+            ) from exc
 
     def _configure_in_place(self) -> None:
         if not self._in_place:
@@ -1980,6 +2000,26 @@ class IPFSManager:
             raise IPFSOperationError(f"provide of {cid} failed: {exc}") from exc
         finally:
             resp.close()
+
+    def mfs_add(self, cid: str, path: str) -> None:
+        """Put ``cid`` in this node's MFS at ``path``, making the folders on
+        the way. Kept from garbage collection, and announced to the DHT by a
+        daemon started with ``provide_strategy="mfs"``. Already there: fine."""
+        folder = path.rsplit("/", 1)[0] or "/"
+        self._post("files/mkdir", params={"arg": folder, "parents": "true"})
+        try:
+            self._post("files/cp", params=[("arg", f"/ipfs/{cid}"), ("arg", path)])
+        except IPFSOperationError as exc:
+            if "already" not in str(exc).lower():
+                raise
+
+    def mfs_remove(self, path: str) -> None:
+        """Take ``path`` out of this node's MFS. Not there: fine."""
+        try:
+            self._post("files/rm", params={"arg": path, "recursive": "true"})
+        except IPFSOperationError as exc:
+            if "does not exist" not in str(exc).lower() and "not exist" not in str(exc).lower():
+                raise
 
     def block_exists(self, cid: str) -> bool:
         # offline=true is critical: without it, Kubo will try to fetch the

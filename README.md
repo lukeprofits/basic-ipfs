@@ -252,6 +252,23 @@ pinned by being put: `pin_add(cid, recursive=False)` keeps that block alone
 and nothing it links to, and `pin_rm(cid, recursive=False)` lets it go.
 `provide(cid)` tells the DHT this node has it.
 
+### What your node tells the world it has
+
+Kubo announces to the DHT **every block it has**, again every day: that is its
+`Provide.Strategy` of `"all"`, and `add(..., provide=False)` does not change
+it. Anyone can then look up a CID and find your node. For a program whose
+node holds things it must not be seen to hold, start the daemon with
+`provide_strategy="mfs"`: then only what is in the node's MFS is announced,
+and `mfs_add(cid, "/shown/<cid>")` / `mfs_remove(path)` are how you choose.
+
+```python
+node = basic_ipfs.IPFSManager(provide_strategy="mfs")
+node.start()
+cid = node.add(b"for everyone")
+node.mfs_add(cid, f"/shown/{cid}")    # announced, and kept from GC
+node.mfs_remove(f"/shown/{cid}")      # no longer announced
+```
+
 ### Two-node example
 
 Anything you `add()` on one machine can be `get()`-ed on another that knows
