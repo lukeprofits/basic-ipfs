@@ -4,13 +4,18 @@ An intentionally tiny IPFS library for Python. Zero setup, real Kubo node under 
 
 ### Description
 
-`basic-ipfs` does exactly five things:
+At its core `basic-ipfs` does five things:
 
 - Add a file or bytes to [IPFS](https://ipfs.tech/) and pin it (returns a [CID](https://docs.ipfs.tech/concepts/content-addressing/))
 - Announce a file or bytes to IPFS without pinning (returns a CID — content may be GC'd)
 - Get content back by CID (as bytes, or written to disk)
 - Pin one CID or a list of CIDs (so they never get garbage-collected)
 - Unpin one CID or a list of CIDs (idempotent — safe to re-run)
+
+For a program that needs more there is a node of its own, byte-range reads,
+peer-to-peer streams, publish/listen topics, adding a file in place, single
+blocks, and choosing what your node announces -- each off unless you ask (see
+below).
 
 It also runs and manages a real [Kubo](https://github.com/ipfs/kubo) node for you — auto-downloaded on first use, auto-shutdown on exit. No daemon to install, no config files to edit, no accounts. (See [Privacy](#privacy) below — the default daemon does join the public IPFS network.)
 
@@ -52,6 +57,7 @@ cid = basic_ipfs.compute_cid_locally("photo.jpg")
 # Get — returns bytes, or writes to disk if you pass an output path
 data = basic_ipfs.get(cid)
 basic_ipfs.get(cid, "copy.jpg")
+part = basic_ipfs.get(cid, offset=1000, length=500)   # just those bytes
 
 # Pin — one CID, or a whole list (one HTTP round-trip per ~500 CIDs)
 basic_ipfs.pin(cid)
@@ -328,7 +334,9 @@ REQUESTS_CA_BUNDLE=/etc/ssl/corp-ca.pem \
 python your_script.py
 ```
 
-If outbound access to `dist.ipfs.tech` is blocked, pre-place the binary at
+If `dist.ipfs.tech` cannot be reached, the first call fails in about a
+minute with `IPFSBinaryNotFound`, naming the URL and the exact path to put
+the binary at. If outbound access to `dist.ipfs.tech` is blocked, pre-place the binary at
 `<user_data_dir>/basic_ipfs/bin/<platform>/ipfs` (or `ipfs.exe` on Windows)
 and `basic-ipfs` will skip the download entirely. The bundled
 `<site-packages>/basic_ipfs/bin/<platform>/ipfs` path is also honoured
@@ -400,8 +408,12 @@ For non-public data, you have three escape hatches — pick what fits:
 ```python
 import basic_ipfs
 
-# 1. Per-call: skip the DHT announce on a single add()
-cid = basic_ipfs.add(b"private", provide=False)
+# 1. Announce only what you choose: a node of your own that tells the
+#    DHT only what you list (add(provide=False) alone does not do this).
+node = basic_ipfs.IPFSManager(provide_strategy="mfs")
+node.start()
+cid = node.add(b"private")              # kept, not announced
+node.mfs_add(cid, f"/shown/{cid}")      # only if you want it found
 
 # 2. Private network: only peers with the same 256-bit swarm key can
 #    connect. Run BEFORE start() / the first IPFS operation.
