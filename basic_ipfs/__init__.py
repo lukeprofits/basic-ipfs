@@ -1115,6 +1115,7 @@ class IPFSManager:
             _swarm_key_warn_if_world_readable()
             self._start_daemon()
             self._wait_for_api()
+            self._check_provide_strategy()
         except BaseException:
             # A half-completed start must not leak the daemon we may have
             # just spawned: a startup failure after Popen (e.g. a slow
@@ -1292,6 +1293,30 @@ class IPFSManager:
             raise IPFSError(
                 f"could not set what this node announces: {exc.stderr.strip()}"
             ) from exc
+
+    def _check_provide_strategy(self) -> None:
+        """Refuse a daemon that announces by another strategy than asked.
+
+        The strategy is written to the repository only when this manager
+        starts the daemon. One already running -- left from an earlier run,
+        or started by something else -- announces by whatever it was started
+        with, and that may be everything.
+        """
+        if self._provide_strategy is None:
+            return
+        try:
+            running = self._post(
+                "config", params={"arg": "Provide.Strategy"}, timeout=5
+            ).json().get("Value")
+        except (IPFSOperationError, ValueError) as exc:
+            raise IPFSError(f"could not read what this node announces: {exc}") from exc
+        # Unset means Kubo's default, which is "all".
+        if (running or "all") != self._provide_strategy:
+            raise IPFSError(
+                f"the daemon at {self._host}:{self._port} announces by "
+                f"{running or 'all'!r}, not {self._provide_strategy!r}: stop it "
+                "and start again, so that this manager can set it"
+            )
 
     def _configure_in_place(self) -> None:
         if not self._in_place:
@@ -2009,6 +2034,8 @@ class IPFSManager:
         Stops at ``limit`` or when the lookup ends; a lookup that runs out
         of time returns what it found so far rather than raising.
         """
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError(f"limit must be a positive int, not {limit!r}")
         params = {"arg": cid, "num-providers": str(limit)}
         if timeout is not None:
             # The daemon's own limit: the reply streams the whole time, so a

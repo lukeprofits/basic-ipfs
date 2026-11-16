@@ -72,6 +72,11 @@ def test_only_what_is_in_mfs_is_scheduled_for_the_dht(tmp_path: Path) -> None:
         m.mfs_remove(f"/shown/{shown}")
         m.mfs_remove(f"/shown/{shown}")  # gone already is fine
         assert not m._post("files/ls", params={"arg": "/shown"}).json().get("Entries")
+        # a second manager that would announce otherwise does not attach
+        other = basic_ipfs.IPFSManager(port=5629, repo=tmp_path / "ipfs", provide_strategy="all")
+        with pytest.raises(basic_ipfs.IPFSError, match="announces by 'mfs'"):
+            other.start()
+        assert m.is_daemon_up()  # and the running one is left as it was
     finally:
         m.stop()
 
@@ -97,9 +102,7 @@ class _Lines:
 def _provider(*peers: str) -> bytes:
     import json
 
-    return json.dumps(
-        {"Type": 4, "Responses": [{"ID": p, "Addrs": []} for p in peers]}
-    ).encode()
+    return json.dumps({"Type": 4, "Responses": [{"ID": p, "Addrs": []} for p in peers]}).encode()
 
 
 def test_who_has_reads_providers_alone_and_stops_at_the_limit() -> None:
@@ -135,3 +138,33 @@ def test_who_has_reads_providers_alone_and_stops_at_the_limit() -> None:
         [_provider("12D3a"), _provider("12D3b")], fail_after=1
     )
     assert m.who_has("bafyx") == ["12D3a"]
+
+
+def test_a_running_daemon_that_announces_otherwise_is_refused() -> None:
+    m = basic_ipfs.IPFSManager(provide_strategy="mfs")
+
+    class Reply:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+        def json(self) -> Any:
+            return {"Key": "Provide.Strategy", "Value": self.value}
+
+    for running, ok in (("mfs", True), ("all", False), (None, False), ("", False)):
+        m._post = lambda endpoint, r=running, **kw: Reply(r)  # type: ignore[method-assign,assignment,misc]
+        if ok:
+            m._check_provide_strategy()
+        else:
+            with pytest.raises(basic_ipfs.IPFSError, match="announces by"):
+                m._check_provide_strategy()
+
+    def unreadable(endpoint: str, **kw: Any) -> Any:
+        raise basic_ipfs.IPFSOperationError("no such key")
+
+    m._post = unreadable  # type: ignore[method-assign]
+    with pytest.raises(basic_ipfs.IPFSError, match="could not read"):
+        m._check_provide_strategy()
+    # a manager that asked for nothing checks nothing
+    plain = basic_ipfs.IPFSManager()
+    plain._post = unreadable  # type: ignore[method-assign]
+    plain._check_provide_strategy()
