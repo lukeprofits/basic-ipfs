@@ -335,6 +335,10 @@ def _download_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
         total=3,
+        # A host that does not answer is tried once more, not three times:
+        # each try already walks every address it has, and dist.ipfs.tech
+        # has six, so each try can take six connect timeouts.
+        connect=1,
         backoff_factor=2,
         status_forcelist=(502, 503, 504, 520, 522, 524),
         allowed_methods=frozenset(["GET", "HEAD"]),
@@ -434,11 +438,11 @@ class _PinnedRedirectAdapter(requests.adapters.HTTPAdapter):
         return resp
 
 
-#: Seconds to reach the download host, and the longest the download may
-#: stall between chunks. Not a limit on the whole: a slow line still
-#: finishes. A host that cannot be reached at all is said so in about two
-#: minutes (four tries), not after forty.
-_DOWNLOAD_TIMEOUT = (20, 120)
+#: Seconds to reach one address of the download host, and the longest the
+#: download may stall between chunks. Not a limit on the whole: a slow line
+#: still finishes. A host that cannot be reached at all is said so in about
+#: two minutes (two tries over its six addresses), not after forty.
+_DOWNLOAD_TIMEOUT = (10, 120)
 
 
 def _download(

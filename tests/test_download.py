@@ -593,4 +593,4 @@ def test_a_host_that_cannot_be_reached_is_said_plainly(tmp_path, monkeypatch):
         basic_ipfs._auto_download_kubo(dest)
     assert str(dest) in str(e.value)
     assert not list((tmp_path / "bin").glob("*partial*"))
-    assert basic_ipfs._DOWNLOAD_TIMEOUT == (20, 120)
+    assert basic_ipfs._DOWNLOAD_TIMEOUT == (10, 120)
