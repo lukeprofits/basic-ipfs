@@ -35,9 +35,9 @@ import basic_ipfs
 cid = basic_ipfs.add("photo.jpg")
 cid = basic_ipfs.add(b"hello world")
 
-# provide=False skips the immediate announce. Kubo's default strategy
-# still announces every block it holds on its daily round: to keep
-# something out of the DHT, see "What your node tells the world it has".
+# provide=False is passed to Kubo, which (as of 0.40) ignores it and
+# announces every block it holds: to keep something out of the DHT, see
+# "What your node tells the world it has".
 cid = basic_ipfs.add(b"private data", provide=False)
 
 # Announce — adds to IPFS without pinning; content may be GC'd later
@@ -264,7 +264,9 @@ node holds things it must not be seen to hold, start the daemon with
 `provide_strategy="mfs"`: then only what is in the node's MFS is announced,
 and `mfs_add(cid, "/shown/<cid>")` / `mfs_remove(path)` are how you choose.
 `"mfs"` announces every block under what is listed; `"mfs+entities"` only
-the root of each file, one record per file however large.
+the root of each file. A manager given a strategy will not attach to a
+daemon already running with another: `start()` raises rather than let it
+announce more than you asked.
 
 ```python
 node = basic_ipfs.IPFSManager(provide_strategy="mfs")
@@ -378,9 +380,9 @@ consequences you should understand before publishing anything sensitive:
 
 - **CIDs are advertised.** `add()` announces the content's CID to the
   public DHT. Anyone monitoring the DHT (and crawlers do) can record that
-  your node holds that CID. `provide=False` skips only the immediate
-  announce: Kubo's default `Provide.Strategy` (`"all"`) announces every
-  block on its daily round regardless. Start the daemon with
+  your node holds that CID. `provide=False` does not prevent it: Kubo
+  (as of 0.40) ignores it, and its default `Provide.Strategy` (`"all"`)
+  announces every block it holds. Start the daemon with
   `provide_strategy="mfs"` to announce only what you list.
 - **`get()` is observable.** Fetching an unknown CID dials peers and may
   fall back to public gateways operated by third parties (Protocol Labs,
