@@ -35,8 +35,9 @@ import basic_ipfs
 cid = basic_ipfs.add("photo.jpg")
 cid = basic_ipfs.add(b"hello world")
 
-# Pass provide=False to skip the public-DHT announce (content stays
-# locally addressable, but its presence is not broadcast)
+# provide=False skips the immediate announce. Kubo's default strategy
+# still announces every block it holds on its daily round: to keep
+# something out of the DHT, see "What your node tells the world it has".
 cid = basic_ipfs.add(b"private data", provide=False)
 
 # Announce — adds to IPFS without pinning; content may be GC'd later
@@ -250,7 +251,9 @@ stores one block and returns its CID; `block_get(cid)` reads one back (from
 the network if this node lacks it, unless `local_only=True`). A block is not
 pinned by being put: `pin_add(cid, recursive=False)` keeps that block alone
 and nothing it links to, and `pin_rm(cid, recursive=False)` lets it go.
-`provide(cid)` tells the DHT this node has it.
+`provide(cid)` tells the DHT this node has it, and
+`find_providers(cid, limit=20)` asks the DHT which peers say they have it
+(peer IDs, this node's own included if it announced it).
 
 ### What your node tells the world it has
 
@@ -260,6 +263,8 @@ it. Anyone can then look up a CID and find your node. For a program whose
 node holds things it must not be seen to hold, start the daemon with
 `provide_strategy="mfs"`: then only what is in the node's MFS is announced,
 and `mfs_add(cid, "/shown/<cid>")` / `mfs_remove(path)` are how you choose.
+`"mfs"` announces every block under what is listed; `"mfs+entities"` only
+the root of each file, one record per file however large.
 
 ```python
 node = basic_ipfs.IPFSManager(provide_strategy="mfs")
@@ -373,8 +378,10 @@ consequences you should understand before publishing anything sensitive:
 
 - **CIDs are advertised.** `add()` announces the content's CID to the
   public DHT. Anyone monitoring the DHT (and crawlers do) can record that
-  your node holds that CID. Pass `provide=False` to skip the announce —
-  the content is still addressable, but its presence is not broadcast.
+  your node holds that CID. `provide=False` skips only the immediate
+  announce: Kubo's default `Provide.Strategy` (`"all"`) announces every
+  block on its daily round regardless. Start the daemon with
+  `provide_strategy="mfs"` to announce only what you list.
 - **`get()` is observable.** Fetching an unknown CID dials peers and may
   fall back to public gateways operated by third parties (Protocol Labs,
   Cloudflare). Those parties learn what you asked for.

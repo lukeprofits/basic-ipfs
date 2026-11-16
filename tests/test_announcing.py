@@ -74,3 +74,59 @@ def test_only_what_is_in_mfs_is_scheduled_for_the_dht(tmp_path: Path) -> None:
         assert not m._post("files/ls", params={"arg": "/shown"}).json().get("Entries")
     finally:
         m.stop()
+
+
+class _Lines:
+    """A streamed reply from Kubo: newline-delimited JSON."""
+
+    def __init__(self, lines: list[bytes], fail_after: int | None = None) -> None:
+        self.lines, self.fail_after, self.closed = lines, fail_after, False
+
+    def iter_lines(self) -> Any:
+        import requests
+
+        for n, line in enumerate(self.lines):
+            if self.fail_after is not None and n == self.fail_after:
+                raise requests.ConnectionError("read timed out")
+            yield line
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _provider(*peers: str) -> bytes:
+    import json
+
+    return json.dumps(
+        {"Type": 4, "Responses": [{"ID": p, "Addrs": []} for p in peers]}
+    ).encode()
+
+
+def test_find_providers_reads_providers_alone_and_stops_at_the_limit() -> None:
+    m = basic_ipfs.IPFSManager()
+    asked: list[tuple[str, Any]] = []
+    reply = _Lines(
+        [
+            b'{"Type": 0, "ID": "12D3query", "Responses": null}',  # a query step
+            b"",
+            b"not json",
+            _provider("12D3a"),
+            _provider("12D3a", "12D3b"),  # the same one again
+            _provider("12D3c"),
+            _provider("12D3d"),
+        ]
+    )
+
+    def post(endpoint: str, **kw: Any) -> Any:
+        asked.append((endpoint, kw["params"]))
+        return reply
+
+    m._post = post  # type: ignore[method-assign,assignment]
+    assert m.find_providers("bafyx", limit=3) == ["12D3a", "12D3b", "12D3c"]
+    assert asked == [("routing/findprovs", {"arg": "bafyx", "num-providers": "3"})]
+    assert reply.closed
+    # a lookup cut short answers with what it had
+    m._post = lambda endpoint, **kw: _Lines(  # type: ignore[method-assign,assignment]
+        [_provider("12D3a"), _provider("12D3b")], fail_after=1
+    )
+    assert m.find_providers("bafyx") == ["12D3a"]

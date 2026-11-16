@@ -1618,9 +1618,8 @@ class IPFSManager:
         if raw_leaves is not None:
             params.append(("raw-leaves", "true" if raw_leaves else "false"))
         if not provide:
-            # Skip DHT announce. Content is still locally addressable; peers
-            # who already know the CID can fetch via bitswap, but no provider
-            # record is published.
+            # Asked of Kubo, which as of 0.40 ignores it: what is announced
+            # is its Provide.Strategy's choice (see provide_strategy).
             params.append(("provide", "false"))
         if where is not None:
             params.append(("nocopy", "true"))
@@ -2001,6 +2000,44 @@ class IPFSManager:
         finally:
             resp.close()
 
+    def find_providers(
+        self, cid: str, *, limit: int = 20, timeout: float | None = 60
+    ) -> list[str]:
+        """Peer IDs the DHT says have ``cid``, at most ``limit``, in the
+        order they were found. This node is included if it has announced it.
+
+        Stops at ``limit`` or when the lookup ends; a lookup that runs out
+        of time returns what it found so far rather than raising.
+        """
+        resp = self._post(
+            "routing/findprovs",
+            params={"arg": cid, "num-providers": str(limit)},
+            stream=True,
+            timeout=timeout,
+        )
+        found: list[str] = []
+        try:
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("Type") != 4:  # 4: a provider was found
+                    continue
+                for answer in event.get("Responses") or []:
+                    peer = answer.get("ID")
+                    if isinstance(peer, str) and peer and peer not in found:
+                        found.append(peer)
+                if len(found) >= limit:
+                    break
+        except requests.RequestException:
+            pass  # out of time: what was found is still the answer
+        finally:
+            resp.close()
+        return found[:limit]
+
     def mfs_add(self, cid: str, path: str) -> None:
         """Put ``cid`` in this node's MFS at ``path``, making the folders on
         the way. Kept from garbage collection, and announced to the DHT by a
@@ -2309,10 +2346,11 @@ def add(
 ) -> str:
     """Add a file (path or bytes) to IPFS and pin it. Returns the CID.
 
-    Pass ``provide=False`` to skip the DHT announce — the content is still
-    addressable by CID, but its presence on this node is not advertised to
-    the public network. Useful for staging private data before deciding
-    whether to publish.
+    ``provide=False`` asks Kubo not to announce it. Kubo 0.40 ignores that
+    and announces by its ``Provide.Strategy``, which by default is every
+    block it holds: to keep content out of the DHT, run the daemon with
+    ``provide_strategy="mfs"`` and list only what is to be announced
+    (``mfs_add``).
 
     ``timeout`` (seconds) bounds the upload. Default ``None`` waits as
     long as the daemon needs (right for huge files).
@@ -2341,7 +2379,7 @@ def announce(
     """Add a file (path or bytes) to IPFS without pinning. Returns the CID.
 
     Content is available on the network but may be garbage-collected unless
-    pinned later. Pass ``provide=False`` to skip the DHT announce.
+    pinned later. ``provide=False``: see :func:`add`.
     ``timeout`` (seconds) bounds the upload; default is no timeout.
     """
     return _get_manager().announce(source, provide=provide, timeout=timeout)
