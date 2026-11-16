@@ -578,3 +578,19 @@ def test_check_redirect_origin_rejects_plain_http():
 def test_check_redirect_origin_allows_loopback_http(monkeypatch):
     monkeypatch.setattr(basic_ipfs, "_ALLOWED_DOWNLOAD_HOSTS", ("127.0.0.1",))
     basic_ipfs._check_redirect_origin("http://127.0.0.1:8000/kubo.tar.gz")
+
+
+def test_a_host_that_cannot_be_reached_is_said_plainly(tmp_path, monkeypatch):
+    import requests
+
+    def unreachable(url, dest, *a, **k):
+        raise requests.ConnectTimeout("timed out")
+
+    monkeypatch.setattr(basic_ipfs, "_download", unreachable)
+    monkeypatch.setattr(basic_ipfs, "_check_disk_space", lambda dest: None)
+    dest = tmp_path / "bin" / "ipfs"
+    with pytest.raises(basic_ipfs.IPFSBinaryNotFound, match="could not download Kubo") as e:
+        basic_ipfs._auto_download_kubo(dest)
+    assert str(dest) in str(e.value)
+    assert not list((tmp_path / "bin").glob("*partial*"))
+    assert basic_ipfs._DOWNLOAD_TIMEOUT == (20, 120)

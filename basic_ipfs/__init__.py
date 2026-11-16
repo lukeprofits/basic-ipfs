@@ -434,7 +434,16 @@ class _PinnedRedirectAdapter(requests.adapters.HTTPAdapter):
         return resp
 
 
-def _download(url: str, dest: Path, timeout: int = 600) -> str:
+#: Seconds to reach the download host, and the longest the download may
+#: stall between chunks. Not a limit on the whole: a slow line still
+#: finishes. A host that cannot be reached at all is said so in about two
+#: minutes (four tries), not after forty.
+_DOWNLOAD_TIMEOUT = (20, 120)
+
+
+def _download(
+    url: str, dest: Path, timeout: float | tuple[float, float] = _DOWNLOAD_TIMEOUT
+) -> str:
     """Stream ``url`` into ``dest``, returning the SHA-512 hex digest.
 
     The whole archive used to be buffered in memory, which let a hostile
@@ -637,7 +646,14 @@ def _auto_download_kubo(dest: Path) -> None:
     partial.unlink(missing_ok=True)
 
     try:
-        actual = _download(archive_url, archive_tmp)
+        try:
+            actual = _download(archive_url, archive_tmp)
+        except requests.RequestException as exc:
+            raise IPFSBinaryNotFound(
+                f"could not download Kubo {KUBO_VERSION} from {archive_url} "
+                f"({type(exc).__name__}): check the connection and try again, "
+                f"or put an ipfs binary at {dest} yourself"
+            ) from exc
         if not hmac.compare_digest(actual, expected):
             raise IPFSBinaryNotFound(
                 f"SHA-512 mismatch for Kubo {KUBO_VERSION} ({_platform_key()}): "
