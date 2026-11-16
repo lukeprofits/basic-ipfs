@@ -252,7 +252,7 @@ the network if this node lacks it, unless `local_only=True`). A block is not
 pinned by being put: `pin_add(cid, recursive=False)` keeps that block alone
 and nothing it links to, and `pin_rm(cid, recursive=False)` lets it go.
 `provide(cid)` tells the DHT this node has it, and
-`find_providers(cid, limit=20)` asks the DHT which peers say they have it
+`who_has(cid, limit=20)` asks the DHT which peers say they have it
 (peer IDs, this node's own included if it announced it).
 
 ### What your node tells the world it has

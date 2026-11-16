@@ -102,7 +102,7 @@ def _provider(*peers: str) -> bytes:
     ).encode()
 
 
-def test_find_providers_reads_providers_alone_and_stops_at_the_limit() -> None:
+def test_who_has_reads_providers_alone_and_stops_at_the_limit() -> None:
     m = basic_ipfs.IPFSManager()
     asked: list[tuple[str, Any]] = []
     reply = _Lines(
@@ -122,11 +122,11 @@ def test_find_providers_reads_providers_alone_and_stops_at_the_limit() -> None:
         return reply
 
     m._post = post  # type: ignore[method-assign,assignment]
-    assert m.find_providers("bafyx", limit=3) == ["12D3a", "12D3b", "12D3c"]
+    assert m.who_has("bafyx", limit=3) == ["12D3a", "12D3b", "12D3c"]
     assert asked == [("routing/findprovs", {"arg": "bafyx", "num-providers": "3"})]
     assert reply.closed
     # a lookup cut short answers with what it had
     m._post = lambda endpoint, **kw: _Lines(  # type: ignore[method-assign,assignment]
         [_provider("12D3a"), _provider("12D3b")], fail_after=1
     )
-    assert m.find_providers("bafyx") == ["12D3a"]
+    assert m.who_has("bafyx") == ["12D3a"]

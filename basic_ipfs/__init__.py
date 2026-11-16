@@ -2000,7 +2000,7 @@ class IPFSManager:
         finally:
             resp.close()
 
-    def find_providers(
+    def who_has(
         self, cid: str, *, limit: int = 20, timeout: float | None = 60
     ) -> list[str]:
         """Peer IDs the DHT says have ``cid``, at most ``limit``, in the
