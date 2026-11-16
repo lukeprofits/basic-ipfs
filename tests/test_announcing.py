@@ -123,7 +123,12 @@ def test_who_has_reads_providers_alone_and_stops_at_the_limit() -> None:
 
     m._post = post  # type: ignore[method-assign,assignment]
     assert m.who_has("bafyx", limit=3) == ["12D3a", "12D3b", "12D3c"]
-    assert asked == [("routing/findprovs", {"arg": "bafyx", "num-providers": "3"})]
+    assert asked == [
+        (
+            "routing/findprovs",
+            {"arg": "bafyx", "num-providers": "3", "timeout": "60s"},
+        )
+    ]
     assert reply.closed
     # a lookup cut short answers with what it had
     m._post = lambda endpoint, **kw: _Lines(  # type: ignore[method-assign,assignment]

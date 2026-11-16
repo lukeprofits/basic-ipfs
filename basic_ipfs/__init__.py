@@ -2009,11 +2009,16 @@ class IPFSManager:
         Stops at ``limit`` or when the lookup ends; a lookup that runs out
         of time returns what it found so far rather than raising.
         """
+        params = {"arg": cid, "num-providers": str(limit)}
+        if timeout is not None:
+            # The daemon's own limit: the reply streams the whole time, so a
+            # read timeout alone never fires and the walk would run on.
+            params["timeout"] = f"{timeout:g}s"
         resp = self._post(
             "routing/findprovs",
-            params={"arg": cid, "num-providers": str(limit)},
+            params=params,
             stream=True,
-            timeout=timeout,
+            timeout=None if timeout is None else timeout + 10,
         )
         found: list[str] = []
         try:
