@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]  # macos-latest is arm64; macos-14 was retired
         python: ["3.10", "3.13"]
         include:
           - os: ubuntu-latest
