@@ -594,3 +594,33 @@ def test_a_host_that_cannot_be_reached_is_said_plainly(tmp_path, monkeypatch):
     assert str(dest) in str(e.value)
     assert not list((tmp_path / "bin").glob("*partial*"))
     assert basic_ipfs._DOWNLOAD_TIMEOUT == (10, 120)
+
+
+def test_archive_urls_put_dist_first_then_each_mirror():
+    urls = basic_ipfs._archive_urls()
+    assert urls[0].startswith("https://dist.ipfs.tech/kubo/")
+    name = urls[0].rsplit("/", 1)[1]
+    assert urls[1] == (
+        f"https://github.com/ipfs/kubo/releases/download/"
+        f"{basic_ipfs.KUBO_VERSION}/{name}"
+    )
+    for url in urls:
+        basic_ipfs._check_redirect_origin(url)  # every one is allowed
+
+
+def test_a_mirror_is_used_when_dist_does_not_answer(allow_loopback_host, monkeypatch, tmp_path):
+    """dist.ipfs.tech down: the archive comes from the next source, and is
+    still checked against the baked-in SHA-512, not anything served."""
+    with _live_server() as base:
+        dead = "http://127.0.0.1:9/kubo"  # discard port: nothing answers
+        monkeypatch.setattr(basic_ipfs, "KUBO_DIST_BASE", dead)
+        monkeypatch.setattr(basic_ipfs, "KUBO_MIRRORS", (base,))
+        monkeypatch.setattr(
+            basic_ipfs, "_archive_info", lambda: (f"{dead}/chain", "tar.gz")
+        )
+        urls = basic_ipfs._archive_urls()
+        assert urls == [f"{dead}/chain", f"{base}/chain"]
+        with pytest.raises(IPFSBinaryNotFound, match="SHA-512 mismatch"):
+            # the mirror answered; its bytes are not Kubo's, and are refused
+            basic_ipfs._auto_download_kubo(tmp_path / "ipfs")
+    assert not (tmp_path / "ipfs").exists()

@@ -78,11 +78,22 @@ APP_NAME = "basic_ipfs"
 # Pinned Kubo version — downloaded automatically if not already present.
 KUBO_VERSION = "v0.40.1"
 KUBO_DIST_BASE = "https://dist.ipfs.tech/kubo"
+#: Tried in turn when dist.ipfs.tech does not answer: the same archives, under
+#: the same names, from Kubo's GitHub releases. The SHA-512 checked is the one
+#: baked into this package, never one served beside the archive, so a second
+#: source adds a way in without adding anyone to trust.
+KUBO_MIRRORS = ("https://github.com/ipfs/kubo/releases/download",)
 
 # Hostnames the download is permitted to redirect to. TLS still catches a
 # MitM, but pinning the origin means a 30x to attacker.example also fails
 # instead of relying on the SHA-512 check alone.
-_ALLOWED_DOWNLOAD_HOSTS = ("dist.ipfs.tech",)
+_ALLOWED_DOWNLOAD_HOSTS = (
+    "dist.ipfs.tech",
+    # GitHub releases, and the host its downloads redirect to
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+)
 
 # Where the IPFS repo lives. None = platformdirs.user_data_dir(APP_NAME)
 REPO_PATH: Path | None = None
@@ -323,6 +334,17 @@ def _archive_info() -> tuple[str, str]:
     ext = "zip" if os_name == "windows" else "tar.gz"
     name = f"kubo_{KUBO_VERSION}_{os_name}-{arch}.{ext}"
     return f"{KUBO_DIST_BASE}/{KUBO_VERSION}/{name}", ext
+
+
+def _archive_urls() -> list[str]:
+    """Where the archive may be had, dist.ipfs.tech first, then each mirror."""
+    primary, _ext = _archive_info()
+    urls = [primary]
+    prefix = f"{KUBO_DIST_BASE}/"
+    if primary.startswith(prefix):
+        rest = primary[len(prefix):]
+        urls += [f"{base}/{rest}" for base in KUBO_MIRRORS]
+    return urls
 
 
 def _download_session() -> requests.Session:
@@ -650,14 +672,22 @@ def _auto_download_kubo(dest: Path) -> None:
     partial.unlink(missing_ok=True)
 
     try:
-        try:
-            actual = _download(archive_url, archive_tmp)
-        except requests.RequestException as exc:
+        tried = []
+        for url in _archive_urls():
+            try:
+                actual = _download(url, archive_tmp)
+                archive_url = url
+                break
+            except requests.RequestException as exc:
+                tried.append(f"{url} ({type(exc).__name__})")
+                logger.info("Kubo not had from %s: %s", url, exc)
+                archive_tmp.unlink(missing_ok=True)
+        else:
             raise IPFSBinaryNotFound(
-                f"could not download Kubo {KUBO_VERSION} from {archive_url} "
-                f"({type(exc).__name__}): check the connection and try again, "
+                f"could not download Kubo {KUBO_VERSION} from "
+                f"{'; nor '.join(tried)}: check the connection and try again, "
                 f"or put an ipfs binary at {dest} yourself"
-            ) from exc
+            )
         if not hmac.compare_digest(actual, expected):
             raise IPFSBinaryNotFound(
                 f"SHA-512 mismatch for Kubo {KUBO_VERSION} ({_platform_key()}): "
